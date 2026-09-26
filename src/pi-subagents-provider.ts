@@ -3,7 +3,8 @@ import { resolveNamedChildProfile, type ResolveNamedChildProfileOptions, type Re
 export interface PiSubagentsChildProfileProviderOptions {
 	agentDir: string;
 	profilesDir?: string;
-	projectTrusted?: boolean;
+	/** Host-owned trust decision evaluated independently for every target cwd. */
+	resolveProjectTrust?: (cwd: string) => boolean | Promise<boolean>;
 	allowProjectProfiles?: boolean;
 	validateModel?: ResolveNamedChildProfileOptions["validateModel"];
 	piVersion?: string;
@@ -20,12 +21,12 @@ export function createPiSubagentsChildProfileProvider(options: PiSubagentsChildP
 } {
 	return {
 		name: "pi-profile-switch",
-		resolve: ({ name, cwd }) => resolveNamedChildProfile({
+		resolve: async ({ name, cwd }) => resolveNamedChildProfile({
 			name,
 			cwd,
 			agentDir: options.agentDir,
 			...(options.profilesDir ? { profilesDir: options.profilesDir } : {}),
-			...(options.projectTrusted !== undefined ? { projectTrusted: options.projectTrusted } : {}),
+			projectTrusted: options.resolveProjectTrust ? await options.resolveProjectTrust(cwd) : false,
 			...(options.allowProjectProfiles !== undefined ? { allowProjectProfiles: options.allowProjectProfiles } : {}),
 			...(options.validateModel ? { validateModel: options.validateModel } : {}),
 			...(options.piVersion ? { piVersion: options.piVersion } : {}),
