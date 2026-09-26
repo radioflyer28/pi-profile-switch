@@ -18,6 +18,7 @@ export interface ResolvedChildProfileV1 {
 	name: string;
 	source: "global" | "project";
 	sourcePath: string;
+	profileContentDigest: Sha256;
 	mode: "replace";
 	digest: Sha256;
 	isolation: "process" | "session";
@@ -174,11 +175,13 @@ export async function resolveNamedChildProfile(options: ResolveNamedChildProfile
 		...(await fileIdentity(extension.entry)),
 		provenance: { origin: extension.origin ?? "unknown" as const },
 	})));
+	const profileIdentity = await fileIdentity(path.resolve(sourcePath(profile, options)));
 	const withoutDigest = {
 		version: CHILD_PROFILE_CONTRACT_VERSION,
 		name: profile.name,
 		source: profile.source,
-		sourcePath: path.resolve(sourcePath(profile, options)),
+		sourcePath: profileIdentity.path,
+		profileContentDigest: profileIdentity.contentDigest,
 		mode: "replace" as const,
 		isolation: definition.child.isolation,
 		resources: { tools, skills, extensions },

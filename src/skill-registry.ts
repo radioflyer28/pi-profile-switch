@@ -15,7 +15,9 @@
  * reflected immediately (glob references re-expand at every start).
  */
 
-import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
+import path from "node:path";
+
+import { DefaultPackageManager, loadSkills, SettingsManager, type ResolvedResource } from "@earendil-works/pi-coding-agent";
 
 export interface SkillEntry {
 	/** Pi skill name (the profile-facing identity). */
@@ -30,24 +32,6 @@ export interface SkillEntry {
 	origin: string;
 	/** Package install root for package-origin skills (patterns are relative to it). */
 	baseDir?: string;
-}
-
-let offlineDiscoveryTail: Promise<void> = Promise.resolve();
-
-async function withOfflineDiscovery<T>(run: () => Promise<T>): Promise<T> {
-	const previous = offlineDiscoveryTail;
-	let release!: () => void;
-	offlineDiscoveryTail = new Promise<void>((resolve) => { release = resolve; });
-	await previous;
-	const savedOffline = process.env.PI_OFFLINE;
-	process.env.PI_OFFLINE = "1";
-	try {
-		return await run();
-	} finally {
-		if (savedOffline === undefined) delete process.env.PI_OFFLINE;
-		else process.env.PI_OFFLINE = savedOffline;
-		release();
-	}
 }
 
 export interface DiscoverSkillsOptions {
@@ -68,38 +52,42 @@ export async function discoverSkills(options: DiscoverSkillsOptions): Promise<Sk
 	const settingsManager = SettingsManager.create(options.cwd, options.agentDir, {
 		projectTrusted: options.projectTrusted ?? false,
 	});
-	const loader = new DefaultResourceLoader({
+	const packageManager = new DefaultPackageManager({ cwd: options.cwd, agentDir: options.agentDir, settingsManager });
+	// Supplying "skip" is Pi's explicit no-install path. Unlike PI_OFFLINE, this
+	// is call-local: concurrent parent/child resolution never mutates process
+	// environment or changes another loader's behavior.
+	const resolved = await packageManager.resolve(async () => "skip");
+	const resources = resolved.skills.filter((resource) => resource.enabled);
+	const skills = loadSkills({
 		cwd: options.cwd,
 		agentDir: options.agentDir,
-		settingsManager,
-		noExtensions: true,
-		noPromptTemplates: true,
-		noThemes: true,
-		noContextFiles: true,
-	});
-	// Pi installs missing configured packages during resolve(); discovery must
-	// stay read-only (no network, no mutations), so offline mode is forced for
-	// the duration of the load. The spawned pi decides on installs itself at
-	// startup, with its own progress UI. Known limitation: skills of a
-	// not-yet-installed package cannot be referenced until after a reload.
-	await withOfflineDiscovery(() => loader.reload());
-	return loader.getSkills().skills.flatMap((skill) => {
+		skillPaths: resources.map((resource) => resource.path),
+		includeDefaults: false,
+	}).skills;
+	const metadataFor = (filePath: string): ResolvedResource["metadata"] | undefined => {
+		const absolute = path.resolve(filePath);
+		return resources
+			.filter((resource) => {
+				const candidate = path.resolve(resource.path);
+				return absolute === candidate || absolute.startsWith(`${candidate}${path.sep}`) || absolute === path.join(candidate, "SKILL.md");
+			})
+			.sort((a, b) => b.path.length - a.path.length)[0]?.metadata;
+	};
+	return skills.flatMap((skill) => {
+		const sourceInfo = metadataFor(skill.filePath) ?? skill.sourceInfo;
+
 		// Project-scoped package skills stay out of the reference vocabulary:
 		// their packages live under the project's .pi/npm and Pi discovers their
 		// skills natively, so a profile reference would add nothing. Project
 		// .pi/skills and ancestor .agents/skills are referenceable.
-		if (skill.sourceInfo.origin === "package" && skill.sourceInfo.scope === "project") {
-			return [];
-		}
-		return [
-			{
-				name: skill.name,
-				filePath: skill.filePath,
-				source: skill.sourceInfo.source,
-				scope: skill.sourceInfo.scope,
-				origin: skill.sourceInfo.origin,
-				baseDir: skill.sourceInfo.baseDir,
-			},
-		];
+		if (sourceInfo.origin === "package" && sourceInfo.scope === "project") return [];
+		return [{
+			name: skill.name,
+			filePath: skill.filePath,
+			source: sourceInfo.source,
+			scope: sourceInfo.scope,
+			origin: sourceInfo.origin,
+			baseDir: sourceInfo.baseDir,
+		}];
 	});
 }
