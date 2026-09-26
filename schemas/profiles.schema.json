@@ -55,6 +55,31 @@
     "instructions": {
       "type": "string",
       "description": "Appended to Pi's fully built system prompt on every turn."
+    },
+    "child": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["isolation", "context"],
+      "description": "Strict replace-mode child launch policy. Child resolution additionally requires explicit tools, skills, and extensions arrays.",
+      "properties": {
+        "isolation": {
+          "type": "string",
+          "enum": ["process", "session"]
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["project", "global", "projectResources"],
+          "properties": {
+            "project": { "type": "boolean" },
+            "global": { "type": "boolean" },
+            "projectResources": {
+              "type": "string",
+              "enum": ["deny", "allow"]
+            }
+          }
+        }
+      }
     }
   }
 }

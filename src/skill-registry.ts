@@ -32,6 +32,24 @@ export interface SkillEntry {
 	baseDir?: string;
 }
 
+let offlineDiscoveryTail: Promise<void> = Promise.resolve();
+
+async function withOfflineDiscovery<T>(run: () => Promise<T>): Promise<T> {
+	const previous = offlineDiscoveryTail;
+	let release!: () => void;
+	offlineDiscoveryTail = new Promise<void>((resolve) => { release = resolve; });
+	await previous;
+	const savedOffline = process.env.PI_OFFLINE;
+	process.env.PI_OFFLINE = "1";
+	try {
+		return await run();
+	} finally {
+		if (savedOffline === undefined) delete process.env.PI_OFFLINE;
+		else process.env.PI_OFFLINE = savedOffline;
+		release();
+	}
+}
+
 export interface DiscoverSkillsOptions {
 	cwd: string;
 	agentDir: string;
@@ -64,14 +82,7 @@ export async function discoverSkills(options: DiscoverSkillsOptions): Promise<Sk
 	// the duration of the load. The spawned pi decides on installs itself at
 	// startup, with its own progress UI. Known limitation: skills of a
 	// not-yet-installed package cannot be referenced until after a reload.
-	const savedOffline = process.env.PI_OFFLINE;
-	process.env.PI_OFFLINE = "1";
-	try {
-		await loader.reload();
-	} finally {
-		if (savedOffline === undefined) delete process.env.PI_OFFLINE;
-		else process.env.PI_OFFLINE = savedOffline;
-	}
+	await withOfflineDiscovery(() => loader.reload());
 	return loader.getSkills().skills.flatMap((skill) => {
 		// Project-scoped package skills stay out of the reference vocabulary:
 		// their packages live under the project's .pi/npm and Pi discovers their

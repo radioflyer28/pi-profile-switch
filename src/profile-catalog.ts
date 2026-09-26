@@ -37,6 +37,15 @@ export interface ProfileModel {
  *  undeclared fields leave Pi's behavior untouched (PRD default-first rule).
  *  Model fields mirror Pi's settings.json keys (defaultProvider/defaultModel/
  *  defaultThinkingLevel) for direct compatibility. */
+export interface ChildProfileDefinition {
+	isolation: "process" | "session";
+	context: {
+		project: boolean;
+		global: boolean;
+		projectResources: "deny" | "allow";
+	};
+}
+
 export interface ProfileDefinition {
 	label?: string;
 	description?: string;
@@ -48,6 +57,8 @@ export interface ProfileDefinition {
 	defaultModel?: string;
 	defaultThinkingLevel?: string;
 	instructions?: string;
+	/** Exact child-launch policy. Omitted profiles retain legacy session-only semantics. */
+	child?: ChildProfileDefinition;
 }
 
 /** Where a profile's definition came from. */
@@ -89,6 +100,36 @@ function readOptionalString(value: unknown, field: string, profileName: string, 
 	return value;
 }
 
+function readChildDefinition(value: unknown, profileName: string, filePath?: string): ChildProfileDefinition | undefined {
+	if (value === undefined) return undefined;
+	const prefix = filePath ? `${filePath}: ` : "";
+	if (!isRecord(value)) throw new CatalogError(`${prefix}profile "${profileName}": "child" must be an object`);
+	const childKeys = new Set(["isolation", "context"]);
+	const unknownChild = Object.keys(value).filter((key) => !childKeys.has(key));
+	if (unknownChild.length > 0) throw new CatalogError(`${prefix}profile "${profileName}": unknown child field(s): ${unknownChild.join(", ")}`);
+	if (value.isolation !== "process" && value.isolation !== "session") {
+		throw new CatalogError(`${prefix}profile "${profileName}": "child.isolation" must be "process" or "session"`);
+	}
+	if (!isRecord(value.context)) throw new CatalogError(`${prefix}profile "${profileName}": "child.context" must be an object`);
+	const contextKeys = new Set(["project", "global", "projectResources"]);
+	const unknownContext = Object.keys(value.context).filter((key) => !contextKeys.has(key));
+	if (unknownContext.length > 0) throw new CatalogError(`${prefix}profile "${profileName}": unknown child.context field(s): ${unknownContext.join(", ")}`);
+	if (typeof value.context.project !== "boolean" || typeof value.context.global !== "boolean") {
+		throw new CatalogError(`${prefix}profile "${profileName}": child context project/global must be booleans`);
+	}
+	if (value.context.projectResources !== "deny" && value.context.projectResources !== "allow") {
+		throw new CatalogError(`${prefix}profile "${profileName}": "child.context.projectResources" must be "deny" or "allow"`);
+	}
+	return {
+		isolation: value.isolation,
+		context: {
+			project: value.context.project,
+			global: value.context.global,
+			projectResources: value.context.projectResources,
+		},
+	};
+}
+
 /** Parses one raw profile definition; exported for the write-side store
  *  (profile-catalog-store.ts) so anything written is loadable. */
 export function parseProfileDefinition(name: string, raw: unknown, filePath?: string): ProfileDefinition {
@@ -113,6 +154,8 @@ export function parseProfileDefinition(name: string, raw: unknown, filePath?: st
 	if (defaultThinkingLevel !== undefined) definition.defaultThinkingLevel = defaultThinkingLevel;
 	const instructions = readOptionalString(raw.instructions, "instructions", name, filePath);
 	if (instructions !== undefined) definition.instructions = instructions;
+	const child = readChildDefinition(raw.child, name, filePath);
+	if (child !== undefined) definition.child = child;
 	return definition;
 }
 
@@ -185,13 +228,21 @@ export class ProfileCatalog {
 	 * CatalogError. Project entries replace same-name global entries.
 	 */
 	static async load(_agentDir: string, options?: { projectDir?: string }): Promise<ProfileCatalog> {
-		const globalProfiles = await loadCatalogDirectory(getGlobalProfilesDir());
+		return ProfileCatalog.loadFromDirectories(
+			getGlobalProfilesDir(),
+			options?.projectDir === undefined ? undefined : path.join(options.projectDir, ".pi", "profiles"),
+		);
+	}
+
+	/** Explicit-directory variant for side-effect-free SDK consumers and tests. */
+	static async loadFromDirectories(globalProfilesDir: string, projectProfilesDir?: string): Promise<ProfileCatalog> {
+		const globalProfiles = await loadCatalogDirectory(globalProfilesDir);
 		const profiles = new Map<string, CatalogEntry>();
 		for (const [name, definition] of globalProfiles) {
 			profiles.set(name, { source: "global", definition });
 		}
-		if (options?.projectDir !== undefined) {
-			const projectProfiles = await loadCatalogDirectory(path.join(options.projectDir, ".pi", "profiles"));
+		if (projectProfilesDir !== undefined) {
+			const projectProfiles = await loadCatalogDirectory(projectProfilesDir);
 			for (const [name, definition] of projectProfiles) {
 				profiles.set(name, { source: "project", definition });
 			}
