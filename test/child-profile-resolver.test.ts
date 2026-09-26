@@ -60,6 +60,7 @@ describe("resolveNamedChildProfile", () => {
 		expect(contract.resources.tools.map((tool) => tool.name)).toEqual(["read", "grep"]);
 		expect(contract.resources.skills[0]?.contentDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
 		expect(contract.resources.extensions[0]?.contentDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
+		expect(contract.profileContentDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
 		expect(contract.digest).toMatch(/^sha256:[a-f0-9]{64}$/);
 		expect(Object.isFrozen(contract)).toBe(true);
 		expect(Object.isFrozen(contract.resources.skills)).toBe(true);
@@ -85,16 +86,27 @@ describe("resolveNamedChildProfile", () => {
 		await expect(resolve("bad-extension")).rejects.toThrow(/extension path not found/);
 	});
 
-	it("resolves two profiles concurrently without active-profile or contract leakage", async () => {
+	it("resolves two profiles concurrently without active-profile, environment, or contract leakage", async () => {
 		await writeProfile("reader", child({ tools: ["read"], child: { isolation: "session", context: { project: false, global: false, projectResources: "deny" } } }));
 		await writeProfile("searcher", child({ tools: ["grep", "find"], child: { isolation: "process", context: { project: true, global: false, projectResources: "deny" } } }));
-
-		const [reader, searcher] = await Promise.all([resolve("reader"), resolve("searcher")]);
-		expect(reader.resources.tools.map((tool) => tool.name)).toEqual(["read"]);
-		expect(searcher.resources.tools.map((tool) => tool.name)).toEqual(["grep", "find"]);
-		expect(reader.isolation).toBe("session");
-		expect(searcher.isolation).toBe("process");
-		expect(reader.digest).not.toBe(searcher.digest);
+		const savedOffline = process.env.PI_OFFLINE;
+		process.env.PI_OFFLINE = "parent-sentinel";
+		const observed: Array<string | undefined> = [];
+		const watcher = setInterval(() => observed.push(process.env.PI_OFFLINE), 0);
+		try {
+			const [reader, searcher] = await Promise.all([resolve("reader"), resolve("searcher")]);
+			expect(reader.resources.tools.map((tool) => tool.name)).toEqual(["read"]);
+			expect(searcher.resources.tools.map((tool) => tool.name)).toEqual(["grep", "find"]);
+			expect(reader.isolation).toBe("session");
+			expect(searcher.isolation).toBe("process");
+			expect(reader.digest).not.toBe(searcher.digest);
+			expect(process.env.PI_OFFLINE).toBe("parent-sentinel");
+			expect(observed.every((value) => value === "parent-sentinel")).toBe(true);
+		} finally {
+			clearInterval(watcher);
+			if (savedOffline === undefined) delete process.env.PI_OFFLINE;
+			else process.env.PI_OFFLINE = savedOffline;
+		}
 	});
 
 	it("requires caller-established trust before project resources or project profiles enter resolution", async () => {
