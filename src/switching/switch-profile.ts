@@ -31,7 +31,7 @@
  * (transient launch selections stay transient).
  */
 
-import { chmod, lstat, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { resolveInitialProfile } from "../launcher/initial-profile.ts";
@@ -55,6 +55,8 @@ export interface SwitchDeps {
 	realAgentDir: string;
 	/** The project working directory. */
 	cwd: string;
+	/** Test seam; production callers use process.platform. */
+	platform?: NodeJS.Platform;
 	/** Pi's live tool registry (pi.getAllTools()): the base set overlay tool
 	 *  disable entries narrow when the profile declares no tools, and the
 	 *  in-session expansion universe for declared references. */
@@ -83,6 +85,7 @@ export interface SwitchResult {
 type FileSnapshot =
 	| { kind: "absent" }
 	| { kind: "symlink"; target: string }
+	| { kind: "hardlink"; target: string }
 	| { kind: "file"; content: string; mode: number };
 
 interface RuntimeSnapshot {
@@ -97,7 +100,7 @@ interface RuntimeSnapshot {
  *  without following them; ENOENT is the only tolerated error — absence is
  *  expected (first launch), while anything else (permissions, unreadable
  *  dir) must not silently disable rollback protection. */
-async function snapshotFile(filePath: string): Promise<FileSnapshot> {
+async function snapshotFile(filePath: string, sharedTarget?: string): Promise<FileSnapshot> {
 	const info = await lstat(filePath).catch((error: NodeJS.ErrnoException) => {
 		// ENOENT is the only tolerated error — absence is expected (first
 		// launch); anything else (permissions, unreadable dir) must not
@@ -109,27 +112,57 @@ async function snapshotFile(filePath: string): Promise<FileSnapshot> {
 	if (info.isSymbolicLink()) {
 		return { kind: "symlink", target: await readlink(filePath) };
 	}
+	if (sharedTarget !== undefined) {
+		try {
+			const targetInfo = await stat(sharedTarget);
+			if (info.isFile() && targetInfo.isFile() && info.dev === targetInfo.dev && info.ino === targetInfo.ino) {
+				return { kind: "hardlink", target: sharedTarget };
+			}
+		} catch {
+			// The target is absent or unreadable; snapshot the runtime file itself.
+		}
+	}
 	return { kind: "file", content: await readFile(filePath, "utf8"), mode: info.mode & 0o777 };
 }
 
-async function snapshotRuntimeFiles(runtimeDir: string): Promise<RuntimeSnapshot> {
+async function snapshotRuntimeFiles(runtimeDir: string, realAgentDir: string): Promise<RuntimeSnapshot> {
 	return {
 		settings: await snapshotFile(path.join(runtimeDir, "settings.json")),
 		plan: await snapshotFile(path.join(runtimeDir, "pi-profile.json")),
-		mcp: await snapshotFile(path.join(runtimeDir, "mcp.json")),
+		mcp: await snapshotFile(path.join(runtimeDir, "mcp.json"), path.join(realAgentDir, "mcp.json")),
 		appendSystem: await snapshotFile(path.join(runtimeDir, "APPEND_SYSTEM.md")),
-		trust: await snapshotFile(path.join(runtimeDir, "trust.json")),
+		trust: await snapshotFile(path.join(runtimeDir, "trust.json"), path.join(realAgentDir, "trust.json")),
 	};
 }
 
 async function restoreFile(filePath: string, snapshot: FileSnapshot): Promise<void> {
-	// rm first, always: restoring a snapshotted FILE must never writeFile
-	// through a symlink the failed switch left on disk — that would write
-	// THROUGH to the link target (the user's real ~/.pi/agent/mcp.json)
-	// instead of replacing the link.
+	if (snapshot.kind === "symlink") {
+		try {
+			if ((await lstat(filePath)).isSymbolicLink() && (await readlink(filePath)) === snapshot.target) return;
+		} catch {}
+	} else if (snapshot.kind === "hardlink") {
+		try {
+			const [current, target] = await Promise.all([stat(filePath), stat(snapshot.target)]);
+			if (current.isFile() && target.isFile() && current.dev === target.dev && current.ino === target.ino) return;
+		} catch {}
+	} else if (snapshot.kind === "file") {
+		try {
+			const current = await lstat(filePath);
+			if (
+				current.isFile() &&
+				(current.mode & 0o777) === snapshot.mode &&
+				(await readFile(filePath, "utf8")) === snapshot.content
+			) return;
+		} catch {}
+	}
+
+	// Remove before restoring: writeFile must never follow a link left by the
+	// failed switch into the user's real agent directory.
 	await rm(filePath, { force: true });
 	if (snapshot.kind === "symlink") {
 		await symlink(snapshot.target, filePath);
+	} else if (snapshot.kind === "hardlink") {
+		await link(snapshot.target, filePath);
 	} else if (snapshot.kind === "file") {
 		await writeFile(filePath, snapshot.content);
 		await chmod(filePath, snapshot.mode);
@@ -181,7 +214,7 @@ export async function switchProfile(
 	await deps.waitForIdle();
 
 	// Snapshot before resolving so the rollback target always exists.
-	const snapshot = await snapshotRuntimeFiles(deps.runtimeDir);
+	const snapshot = await snapshotRuntimeFiles(deps.runtimeDir, deps.realAgentDir);
 
 	// Full launcher resolution: trust gate, catalogs, discovery, model +
 	// MCP validation. Failures here leave the runtime
@@ -206,6 +239,7 @@ export async function switchProfile(
 			: undefined;
 	await writeRuntimeFiles(deps.runtimeDir, resolved.plan, {
 		agentDir: deps.realAgentDir,
+		platform: deps.platform,
 		projectDir: resolved.projectDir,
 		discovery: resolved.discovery,
 		planExtras: {

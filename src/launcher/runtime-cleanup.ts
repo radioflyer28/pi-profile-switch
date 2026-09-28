@@ -38,6 +38,7 @@ import type { Dirent } from "node:fs";
 import { lstat, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 
+import { inspectOwnedMirrorNames, reconcileDeferredRuntimeFiles } from "../runtime-mirror.ts";
 import { MANAGED_INSTANCE_FILES } from "../settings-generator.ts";
 import { getInstancesRootDir } from "../workspace.ts";
 
@@ -210,7 +211,11 @@ async function unrecognizedNames(dir: string): Promise<string[] | undefined> {
 /** Decides every unrecognized entry in `dir`. `undefined` means the directory
  *  could not be inspected — the caller must treat that as unrecognized rather
  *  than as empty. */
-async function classifyUnrecognized(dir: string, agentDir: string): Promise<EntryDecision[] | undefined> {
+async function classifyUnrecognized(
+	dir: string,
+	agentDir: string,
+	ownedMirrorNames: ReadonlySet<string>,
+): Promise<EntryDecision[] | undefined> {
 	let entries: Dirent<string>[];
 	try {
 		entries = await readdir(dir, { withFileTypes: true });
@@ -227,8 +232,9 @@ async function classifyUnrecognized(dir: string, agentDir: string): Promise<Entr
 		} catch {
 			continue; // Vanished under us: nothing to protect.
 		}
-		// Symlinks only point at the real agent dir and hold no data of their own.
-		if (linkStat.isSymbolicLink()) continue;
+		// POSIX symlinks and validated Windows manifest entries only point at or
+		// share storage with the real agent dir and hold no private state.
+		if (linkStat.isSymbolicLink() || ownedMirrorNames.has(entry.name)) continue;
 		if (!MANAGED_INSTANCE_FILES.has(entry.name)) {
 			decisions.push(await decideEntry(entry.name, entryPath, dir, agentDir));
 			continue;
@@ -266,7 +272,12 @@ async function sweepEntry(dir: string, agentDir: string, notices: string[]): Pro
 		if (Date.now() - info.mtimeMs <= NO_PID_GRACE_MS) return [];
 	}
 
-	const decisions = await classifyUnrecognized(dir, agentDir);
+	const reconciliation = await reconcileDeferredRuntimeFiles(dir, agentDir);
+	notices.push(...reconciliation.notices);
+	const ownedMirrorNames = await inspectOwnedMirrorNames(dir, agentDir);
+	for (const name of reconciliation.keptNames) ownedMirrorNames.add(name);
+
+	const decisions = await classifyUnrecognized(dir, agentDir, ownedMirrorNames);
 	if (decisions === undefined) {
 		return [
 			`${dir} was not reclaimed: it could not be inspected (permissions?). Check its contents and delete it manually.`,
@@ -300,13 +311,15 @@ async function sweepEntry(dir: string, agentDir: string, notices: string[]): Pro
 		}
 	}
 
+	const warnings = [...reconciliation.warnings];
 	if (kept.length > 0) {
-		return [
+		warnings.push(
 			`${dir} was not reclaimed: it holds state pi-profile did not generate (${kept.join(", ")}). ` +
 				`Move that state into the real agent dir (it is mirrored on the next launch), or point the extension that ` +
 				`created it at a fixed path via that extension's own configuration, then delete ${dir}.`,
-		];
+		);
 	}
+	if (warnings.length > 0) return warnings;
 
 	await rm(dir, { recursive: true, force: true });
 	return [];

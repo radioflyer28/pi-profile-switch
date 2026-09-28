@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, readFile, readlink, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readlink, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -174,6 +174,39 @@ describe("switchProfile", () => {
 		expect(trustStat.isSymbolicLink()).toBe(true);
 		expect(await readlink(path.join(runtimeDir, "trust.json"))).toBe(agentTrust);
 		await expect(lstat(path.join(runtimeDir, "APPEND_SYSTEM.md"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("restores Windows hard-link identity when a switch fails", async () => {
+		await addGlobalExtension(fixture, "pi-mcp-adapter");
+		await writeFile(
+			path.join(fixture.agentDir, "mcp.json"),
+			JSON.stringify({ mcpServers: { github: { url: "https://x" }, linear: { command: "linear" } } }),
+		);
+		await writeFile(path.join(fixture.agentDir, "trust.json"), JSON.stringify({ projects: {} }));
+		await writeCatalog({ impl: { extensions: ["pi-mcp-adapter"], mcps: ["github"] } });
+		runtimeDir = (
+			await generateRuntimeDir(defaultPlan(), { agentDir: fixture.agentDir, platform: "win32" })
+		).runtimeDir;
+
+		let reloads = 0;
+		await expect(
+			switchProfile("impl", deps({
+				platform: "win32",
+				reload: async () => {
+					reloads += 1;
+					if (reloads === 1) throw new Error("boom");
+				},
+			})),
+		).rejects.toThrow(/restored the previous settings/);
+
+		for (const name of ["mcp.json", "trust.json"]) {
+			const [runtimeInfo, agentInfo] = await Promise.all([
+				stat(path.join(runtimeDir, name)),
+				stat(path.join(fixture.agentDir, name)),
+			]);
+			expect(runtimeInfo.ino).toBe(agentInfo.ino);
+			expect(runtimeInfo.dev).toBe(agentInfo.dev);
+		}
 	});
 
 	it("restores a snapshotted regular file exactly, even after the switch replaced it with a symlink or deleted it", async () => {

@@ -5,7 +5,7 @@
  * Two entry points:
  * - `generateRuntimeDir` (launcher): create a fresh per-launch runtime dir
  *   under the workspace instances root, write the files, mirror the real
- *   agent dir as symlinks (trust.json only for default), derive env.
+ *   agent dir through the platform backend, derive env.
  * - `writeRuntimeFiles` (in-session switch, ticket 05): rewrite
  *   settings.json + pi-profile.json inside the EXISTING runtime dir (the
  *   running process's PI_CODING_AGENT_DIR cannot move), and transition the
@@ -41,7 +41,7 @@
  */
 
 import { existsSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, lstat, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -50,6 +50,11 @@ import { getInstancesRootDir } from "./workspace.ts";
 import { isRecord } from "./json-file.ts";
 import { loadMergedMcpServers } from "./mcp-config.ts";
 import type { SkillEntry } from "./skill-registry.ts";
+import {
+	ensureSharedRuntimeFile,
+	syncAgentMirror,
+	WINDOWS_MIRROR_MANIFEST,
+} from "./runtime-mirror.ts";
 
 /** A configured global package and its resolved install/local root. */
 export interface ConfiguredPackageRoot {
@@ -76,6 +81,8 @@ export interface GenerateOptions {
 	projectDir?: string;
 	/** Required for selection plans; unused for the default profile. */
 	discovery?: DiscoveryContext;
+	/** Test seam; production callers use process.platform. */
+	platform?: NodeJS.Platform;
 }
 
 export interface GeneratedRuntime {
@@ -83,9 +90,11 @@ export interface GeneratedRuntime {
 	runtimeDir: string;
 	/** Environment variables for the spawned pi process. */
 	env: Record<string, string>;
+	/** The user's real agent dir, used for post-child state reconciliation. */
+	agentDir: string;
 }
 
-/** Files managed explicitly by pi-profile in runtimeDir; excluded from auto-symlinking. */
+/** Files managed explicitly by pi-profile in runtimeDir; excluded from automatic mirroring. */
 export const MANAGED_INSTANCE_FILES = new Set([
 	"settings.json",
 	"mcp.json",
@@ -94,12 +103,13 @@ export const MANAGED_INSTANCE_FILES = new Set([
 	"trust.json",
 	"pid",
 	"extensions",
+	WINDOWS_MIRROR_MANIFEST,
 ]);
 
 /** State directories that Pi and its extensions resolve under the agent dir,
  *  and which therefore appear at runtime rather than at install time. They are
  *  seeded in the REAL agent dir before mirroring, so the instance gets a
- *  symlink instead of a private real directory: runtime-created state then
+ *  platform directory link instead of a private real directory: state then
  *  lands where native Pi puts it, and third-party records never embed an
  *  instance path (ADR-0010). Adding a name here needs observed evidence that a
  *  package creates that directory under the agent dir; anything unlisted shows
@@ -107,11 +117,9 @@ export const MANAGED_INSTANCE_FILES = new Set([
 const SEEDED_STATE_DIRS = ["sessions", "missions"] as const;
 
 /** State FILES Pi creates at runtime (same evidence rule as the dirs). They
- *  cannot be created up front — the content is Pi's, not pi-profile's — so the
- *  instance gets a symlink into the real agent dir that is deliberately allowed
- *  to dangle: Pi sees no file, writes through the link, and the real agent dir
- *  gets the file. A real file left here instead would be unrecognized state and
- *  would strand credentials in a directory the sweep refuses to delete. */
+ *  cannot be created up front — the content is Pi's, not pi-profile's. POSIX
+ *  instances get dangling links; Windows records deferred files and reconciles
+ *  them after exit or during the next sweep (ADR-0015). */
 const SEEDED_STATE_FILES = ["auth.json", "models-store.json"] as const;
 
 /** Resource dirs rooted at the real agent dir, re-included for the default
@@ -125,18 +133,6 @@ const UNMANAGED_DIR_KINDS = ["prompts", "themes"] as const;
 async function exists(filePath: string): Promise<boolean> {
 	try {
 		await stat(filePath);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-/** Symlink-aware existence check (lstat): a dangling symlink still counts as
- *  existing — a stat-based check misses it, which would skip its removal or
- *  collide on symlink creation. Use this for paths pi-profile links itself. */
-async function existsLexical(filePath: string): Promise<boolean> {
-	try {
-		await lstat(filePath);
 		return true;
 	} catch {
 		return false;
@@ -200,8 +196,8 @@ function buildSelectionSettings(
 		if (skill.scope === "project") continue;
 		if (selectedPaths.has(skill.filePath)) continue;
 		
-		// If the skill is in the real agentDir, Pi will discover it via the symlink.
-		// We must exclude the symlink path so Pi actually excludes it.
+		// If the skill is in the real agentDir, Pi discovers it through the
+		// instance mirror. Exclude that lexical mirror path so Pi excludes it.
 		// Lexical paths only: Pi matches `-` exclusions against the raw
 		// discovered path without resolving symlinks. Resolving realpaths here
 		// escapes runtimeDir whenever an agentDir skill is a symlink to outside
@@ -305,6 +301,8 @@ export interface RuntimeFileOptions {
 	projectDir?: string;
 	/** Required for selection plans; unused for the default profile. */
 	discovery?: DiscoveryContext;
+	/** Test seam; production callers use process.platform. */
+	platform?: NodeJS.Platform;
 	/** Extra launch-plan fields written by the in-session switch path:
 	 *  `switchedFrom` triggers the one-shot change summary; `persistSelection`
 	 *  tells the post-reload extension instance to save the selection;
@@ -425,18 +423,21 @@ export async function writeRuntimeFiles(
 	// auth.json seed in ADR-0010). An entry that already exists is left alone —
 	// a real file Pi wrote during this session carries its own decision.
 	const trustLink = path.join(runtimeDir, "trust.json");
-	if (!(await existsLexical(trustLink))) {
-		await symlink(path.join(options.agentDir, "trust.json"), trustLink);
-	}
+	await ensureSharedRuntimeFile(path.join(options.agentDir, "trust.json"), trustLink, {
+		platform: options.platform,
+		deferWhenMissing: true,
+	});
 
 	// MCP Servers generation (Ticket 04)
 	const mcpTarget = path.join(options.agentDir, "mcp.json");
 	const mcpInstancePath = path.join(runtimeDir, "mcp.json");
 	if (plan.mcps === undefined) {
-		// No restrictions, symlink
+		// No restrictions: share the user's real file without rewriting it.
 		if (await exists(mcpTarget)) {
-			try { await rm(mcpInstancePath); } catch {}
-			await symlink(mcpTarget, mcpInstancePath);
+			await ensureSharedRuntimeFile(mcpTarget, mcpInstancePath, {
+				platform: options.platform,
+				deferWhenMissing: false,
+			});
 		}
 	} else {
 		// Filter MCP servers
@@ -482,81 +483,18 @@ export async function writeRuntimeFiles(
 		try { await rm(appendSystemPath); } catch {}
 	}
 
-	// Full-fidelity symlink mirroring and dangling link cleanup (Ticket 02).
-	await syncAgentSymlinks(options.agentDir, runtimeDir);
+	// Platform-appropriate full-fidelity mirroring and stale mirror cleanup.
+	await seedRuntimeStateDirs(options.agentDir);
+	await syncAgentMirror(options.agentDir, runtimeDir, MANAGED_INSTANCE_FILES, { platform: options.platform });
+	await seedRuntimeStateFiles(options.agentDir, runtimeDir, options.platform);
 }
 
-/**
- * Full-fidelity symlink mirroring of the user's real agentDir into runtimeDir (Ticket 02).
- * - Excludes profile-managed files.
- * - Mirrors both file and directory symlinks.
- * - Detects and cleans up dangling or obsolete symlinks in runtimeDir.
- * - Avoids recreating identical existing symlinks to minimize startup I/O.
- */
+/** Compatibility export retained for callers of the former POSIX-specific name. */
 export async function syncAgentSymlinks(agentDir: string, runtimeDir: string): Promise<void> {
-	if (!existsSync(agentDir)) return;
-	if (path.resolve(agentDir) === path.resolve(runtimeDir)) return;
-
-	// 1. Clean up dangling or obsolete symlinks in runtimeDir
-	try {
-		const runtimeEntries = await readdir(runtimeDir);
-		for (const name of runtimeEntries) {
-			if (MANAGED_INSTANCE_FILES.has(name)) continue;
-			const linkPath = path.join(runtimeDir, name);
-			const target = path.join(agentDir, name);
-			try {
-				const linkStat = await lstat(linkPath);
-				if (linkStat.isSymbolicLink()) {
-					if (!existsSync(target)) {
-						await rm(linkPath, { recursive: true, force: true });
-					}
-				}
-			} catch {
-				// Best-effort cleanup
-			}
-		}
-	} catch {}
-
-	// 2. Seed the state paths this process's Pi will create at runtime, so their
-	// writes land in the real agent dir instead of an instance-local copy
-	// (ADR-0010). Runs after the cleanup above, which would otherwise remove the
-	// deliberately dangling file links.
-	await seedRuntimeState(agentDir, runtimeDir);
-
-	// 3. Mirror files and directories from agentDir to runtimeDir
-	try {
-		const entries = await readdir(agentDir);
-		for (const name of entries) {
-			if (MANAGED_INSTANCE_FILES.has(name)) continue;
-
-			const target = path.join(agentDir, name);
-			const linkPath = path.join(runtimeDir, name);
-
-			try {
-				const linkStat = await lstat(linkPath).catch(() => null);
-				if (linkStat) {
-					if (linkStat.isSymbolicLink()) {
-						const currentTarget = await readlink(linkPath).catch(() => null);
-						if (currentTarget === target) {
-							continue;
-						}
-					}
-					await rm(linkPath, { recursive: true, force: true });
-				}
-
-				const info = await stat(target);
-				await symlink(target, linkPath, info.isDirectory() ? "dir" : "file");
-			} catch {
-				// Ignore broken source links or unreadable files
-			}
-		}
-	} catch {}
+	await syncAgentMirror(agentDir, runtimeDir, MANAGED_INSTANCE_FILES);
 }
 
-/** Ensures the runtime state paths exist (or are linked) in the real agent dir
- *  and the instance. Best-effort: a failure here leaves the path unseeded, and
- *  the sweep's unrecognized-entry warning names it later. */
-async function seedRuntimeState(agentDir: string, runtimeDir: string): Promise<void> {
+async function seedRuntimeStateDirs(agentDir: string): Promise<void> {
 	for (const name of SEEDED_STATE_DIRS) {
 		try {
 			await mkdir(path.join(agentDir, name), { recursive: true });
@@ -564,19 +502,18 @@ async function seedRuntimeState(agentDir: string, runtimeDir: string): Promise<v
 			// Best-effort: the mirror then simply links nothing for this name.
 		}
 	}
+}
 
+async function seedRuntimeStateFiles(
+	agentDir: string,
+	runtimeDir: string,
+	platform?: NodeJS.Platform,
+): Promise<void> {
 	for (const name of SEEDED_STATE_FILES) {
-		const linkPath = path.join(runtimeDir, name);
-		// A real file here belongs to an earlier run of a different layout, and a
-		// link may already point somewhere else: leave both alone rather than
-		// replacing state pi-profile cannot attribute.
-		if (await existsLexical(linkPath)) continue;
-		try {
-			await symlink(path.join(agentDir, name), linkPath);
-		} catch {
-			// Best-effort: Pi then creates the file inside the instance, and the
-			// sweep keeps that directory instead of deleting it silently.
-		}
+		await ensureSharedRuntimeFile(path.join(agentDir, name), path.join(runtimeDir, name), {
+			platform,
+			deferWhenMissing: true,
+		});
 	}
 }
 
@@ -600,5 +537,6 @@ export async function generateRuntimeDir(
 		env: {
 			PI_CODING_AGENT_DIR: runtimeDir,
 		},
+		agentDir,
 	};
 }

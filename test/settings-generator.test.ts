@@ -1,9 +1,10 @@
 import { existsSync } from "node:fs";
-import { lstat, mkdir, readFile, readlink, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { defaultPlan } from "../src/profile-resolver.ts";
+import { WINDOWS_MIRROR_MANIFEST } from "../src/runtime-mirror.ts";
 import { generateRuntimeDir, writeRuntimeFiles } from "../src/settings-generator.ts";
 import { createPiFixture, type PiFixture } from "./helpers/pi-fixture.ts";
 
@@ -140,6 +141,37 @@ describe("generateRuntimeDir (default profile)", () => {
 		const linkPath = path.join(result.runtimeDir, "auth.json");
 		expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
 		expect(await realpath(linkPath)).toBe(await realpath(path.join(fixture.agentDir, "auth.json")));
+	});
+
+	it("uses hard links and deferred files for Windows state without pre-creating formats", async () => {
+		await writeFile(path.join(fixture.agentDir, "auth.json"), '{"provider":{}}');
+		const result = await generateRuntimeDir(defaultPlan(), { agentDir: fixture.agentDir, platform: "win32" });
+
+		const [agentAuth, runtimeAuth] = await Promise.all([
+			stat(path.join(fixture.agentDir, "auth.json")),
+			stat(path.join(result.runtimeDir, "auth.json")),
+		]);
+		expect(runtimeAuth.ino).toBe(agentAuth.ino);
+		expect(runtimeAuth.dev).toBe(agentAuth.dev);
+		expect(existsSync(path.join(fixture.agentDir, "models-store.json"))).toBe(false);
+		expect(existsSync(path.join(result.runtimeDir, "models-store.json"))).toBe(false);
+		const manifest = JSON.parse(await readFile(path.join(result.runtimeDir, WINDOWS_MIRROR_MANIFEST), "utf8"));
+		expect(manifest.entries["auth.json"]).toBe("hardlink");
+		expect(manifest.entries["models-store.json"]).toBe("deferred-file");
+		expect(manifest.entries["trust.json"]).toBe("deferred-file");
+	});
+
+	it("keeps Windows hard-link identity when the runtime dir is rewritten in place", async () => {
+		await writeFile(path.join(fixture.agentDir, "auth.json"), "{}");
+		const result = await generateRuntimeDir(defaultPlan(), { agentDir: fixture.agentDir, platform: "win32" });
+		await writeRuntimeFiles(result.runtimeDir, defaultPlan(), { agentDir: fixture.agentDir, platform: "win32" });
+
+		const [agentAuth, runtimeAuth] = await Promise.all([
+			stat(path.join(fixture.agentDir, "auth.json")),
+			stat(path.join(result.runtimeDir, "auth.json")),
+		]);
+		expect(runtimeAuth.ino).toBe(agentAuth.ino);
+		expect(runtimeAuth.dev).toBe(agentAuth.dev);
 	});
 
 	it("keeps the seeded links when the runtime dir is rewritten in place", async () => {

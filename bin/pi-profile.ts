@@ -3,7 +3,7 @@
  * pi-profile launcher (ADR-0005).
  *
  * Resolves the initial profile, materializes it as a generated runtime
- * directory (settings + symlinks + env), and spawns the real `pi`
+ * directory (settings + platform mirror + env), and spawns the real `pi`
  * binary with user arguments passed through verbatim.
  *
  * Usage:
