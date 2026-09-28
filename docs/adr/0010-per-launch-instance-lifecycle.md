@@ -1,3 +1,5 @@
+**Superseded by ADR-0015.**
+
 # Instance lifecycle bound to one launch
 
 For the subprocess host and generated settings, see [ADR-0005](0005-subprocess-host-with-generated-settings.md).

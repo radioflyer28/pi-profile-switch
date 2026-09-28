@@ -10,6 +10,11 @@ import {
 	SCAN_MAX_FILES,
 	sweepStaleInstances,
 } from "../src/launcher/runtime-cleanup.ts";
+import {
+	ensureSharedRuntimeFile,
+	syncAgentMirror,
+	WINDOWS_MIRROR_MANIFEST,
+} from "../src/runtime-mirror.ts";
 import { createPiFixture, type PiFixture } from "./helpers/pi-fixture.ts";
 
 let fixture: PiFixture;
@@ -199,6 +204,46 @@ describe("sweepStaleInstances", () => {
 		expect(result.warnings).toEqual([]);
 		expect(result.notices).toHaveLength(1);
 		expect(result.notices[0]).toContain("missions");
+	});
+
+	it("reconciles deferred Windows state before reclaiming an interrupted instance", async () => {
+		const dir = await makeInstanceDir("launch-windows-deferred", { pid: await deadPid() });
+		const agentFile = path.join(fixture.agentDir, "auth.json");
+		const runtimeFile = path.join(dir, "auth.json");
+		await ensureSharedRuntimeFile(agentFile, runtimeFile, { platform: "win32", deferWhenMissing: true });
+		await writeFile(runtimeFile, '{"token":"recovered"}');
+
+		const result = await sweepStaleInstances(fixture.agentDir);
+
+		expect(existsSync(dir)).toBe(false);
+		expect(await readFile(agentFile, "utf8")).toBe('{"token":"recovered"}');
+		expect(result.warnings).toEqual([]);
+		expect(result.notices[0]).toContain("preserved auth.json");
+	});
+
+	it("reclaims validated Windows hard links and junctions as generated entries", async () => {
+		await writeFile(path.join(fixture.agentDir, "shared.txt"), "shared");
+		await mkdir(path.join(fixture.agentDir, "shared-dir"));
+		const dir = await makeInstanceDir("launch-windows-owned", { pid: await deadPid() });
+		await syncAgentMirror(fixture.agentDir, dir, new Set(["pid", WINDOWS_MIRROR_MANIFEST]), { platform: "win32" });
+
+		const result = await sweepStaleInstances(fixture.agentDir);
+
+		expect(existsSync(dir)).toBe(false);
+		expect(result).toEqual({ warnings: [], notices: [] });
+	});
+
+	it("does not trust a corrupt Windows ownership manifest", async () => {
+		const dir = await makeInstanceDir("launch-windows-corrupt", { pid: await deadPid() });
+		const entry = path.join(dir, "private.json");
+		await writeFile(entry, JSON.stringify({ instancePath: dir }));
+		await writeFile(path.join(dir, WINDOWS_MIRROR_MANIFEST), "not json");
+
+		const result = await sweepStaleInstances(fixture.agentDir);
+
+		expect(existsSync(dir)).toBe(true);
+		expect(existsSync(entry)).toBe(true);
+		expect(result.warnings[0]).toContain("private.json");
 	});
 
 	it("reports state written inside a managed directory without adopting or deleting it", async () => {

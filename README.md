@@ -12,6 +12,8 @@ npm install -g pi-profile-switch
 
 Requires [Pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) (installed automatically as a peer dependency).
 
+On Windows, profile instances use directory junctions and file hard links, so Developer Mode and an elevated shell are not required. Keep `PI_PROFILE_SWITCH_DIR` on the same local volume as Pi's real agent directory; Windows cannot hard-link existing files across volumes, and the launcher fails clearly rather than copying mutable state.
+
 ## Quick start
 
 ```bash

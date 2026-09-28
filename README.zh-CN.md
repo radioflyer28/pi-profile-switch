@@ -12,6 +12,8 @@ npm install -g pi-profile-switch
 
 依赖 [Pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)（作为 peer dependency 自动安装）。
 
+在 Windows 上，profile 实例使用目录联接（junction）和文件硬链接，因此不需要开启开发人员模式或使用管理员终端。请将 `PI_PROFILE_SWITCH_DIR` 与 Pi 的真实 agent 目录放在同一个本地卷上；Windows 无法跨卷创建文件硬链接，launcher 会明确报错，而不会复制可变状态。
+
 ## 快速上手
 
 ```bash
