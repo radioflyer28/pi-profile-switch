@@ -2,12 +2,13 @@
  * Spawns the real `pi` binary as a subprocess (ADR-0005).
  *
  * The spawned pi gets: the pi-profile extension via `-e` and the user's
- * arguments verbatim. stdio is inherited so interactive
- * TUI, RPC, and print modes all behave natively; exit codes and signals
- * propagate.
+ * arguments verbatim. cross-spawn resolves npm's Windows `pi.cmd` shim
+ * while preserving an argv-based launch instead of evaluating a shell command
+ * string. stdio is inherited so interactive TUI, RPC, and print modes all
+ * behave natively; exit codes and signals propagate.
  */
 
-import { spawn } from "node:child_process";
+import crossSpawn from "cross-spawn";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,7 +47,7 @@ export async function spawnPi(options: SpawnPiOptions): Promise<number> {
 	const env = { ...process.env, ...options.generated.env };
 	delete env.PI_CODING_AGENT_SESSION_DIR;
 
-	const child = spawn("pi", buildPiArgs(options), {
+	const child = crossSpawn("pi", buildPiArgs(options), {
 		stdio: "inherit",
 		env,
 	});

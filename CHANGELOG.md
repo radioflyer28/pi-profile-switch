@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+* launch Pi through npm's Windows `.cmd` shim without shell command-string evaluation
+* let Pi supply its host package during direct Git installation
+
 ## [0.11.0](https://github.com/VincentFF/pi-profile-switch/compare/v0.10.0...v0.11.0) (2026-09-28)
 
 
