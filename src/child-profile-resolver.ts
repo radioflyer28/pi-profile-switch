@@ -9,7 +9,7 @@ import { ActivationError, BUILTIN_TOOL_NAMES, resolveProfile } from "./profile-r
 import { getGlobalProfilesDir } from "./workspace.ts";
 
 export const CHILD_PROFILE_CONTRACT_VERSION = 1 as const;
-export const PI_PROFILE_SWITCH_PROTOTYPE_VERSION = "0.16.0";
+export const PI_PROFILE_SWITCH_PROTOTYPE_VERSION = "0.16.0-windows-linkless.1";
 
 type Sha256 = `sha256:${string}`;
 

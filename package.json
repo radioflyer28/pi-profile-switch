@@ -1,6 +1,6 @@
 {
   "name": "pi-profile-switch",
-  "version": "0.16.0",
+  "version": "0.16.0-windows-linkless.1",
   "description": "Named profiles for Pi: reference skills, extensions, MCP servers, and tools per workflow, switched without restarting. Install: npm install -g pi-profile-switch (not pi install).",
   "type": "module",
   "keywords": [
