@@ -1,5 +1,6 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { fileSymlinkUnavailable } from "./helpers/symlink-support.ts";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -87,7 +88,7 @@ const EMPTY: ImplicitExtensionDiscovery = { packages: [], local: [], warnings: [
 
 describe("packageNameFromSource", () => {
 	it("strips prefixes and version specs", () => {
-		expect(packageNameFromSource("npm:pi-mcp-adapter")).toBe("pi-mcp-adapter");
+		expect(packageNameFromSource("npm:pi-web-access")).toBe("pi-web-access");
 		expect(packageNameFromSource("npm:@janvitos/pi-plan-build")).toBe("@janvitos/pi-plan-build");
 		expect(packageNameFromSource("npm:@scope/pkg@1.2.3")).toBe("@scope/pkg");
 		expect(packageNameFromSource("npm:pkg@^2.0.0")).toBe("pkg");
@@ -97,15 +98,15 @@ describe("packageNameFromSource", () => {
 
 describe("discoverImplicitExtensions", () => {
 	it("discovers a package's declared pi.extensions entries", async () => {
-		const pkg = await addPackage("pi-mcp-adapter", { extensions: ["./index.ts"] });
+		const pkg = await addPackage("pi-web-access", { extensions: ["./index.ts"] });
 
 		const result = await discoverImplicitExtensions({ cwd: fixture.cwd, agentDir: fixture.agentDir });
 
 		expect(result.warnings).toEqual([]);
 		expect(result.packages).toEqual([
 			{
-				name: "pi-mcp-adapter",
-				source: "npm:pi-mcp-adapter",
+				name: "pi-web-access",
+				source: "npm:pi-web-access",
 				root: pkg.root,
 				entries: [path.join(pkg.root, "index.ts")],
 			},
@@ -303,18 +304,18 @@ describe("discoverImplicitExtensions", () => {
 
 describe("DiscoveredExtensions (pure discovery & selection)", () => {
 	it("selects extensions by package name, alias, and loose file stem", async () => {
-		await addPackage("pi-mcp-adapter", { extensions: ["./index.ts"] });
+		await addPackage("pi-web-access", { extensions: ["./index.ts"] });
 		await addLoose(path.join(fixture.agentDir, "extensions"), "conventions.ts");
 
 		const extensions = await discoverExtensions({ cwd: fixture.cwd, agentDir: fixture.agentDir });
 
-		const selection = await extensions.select(["pi-mcp-adapter", "conventions"]);
+		const selection = await extensions.select(["pi-web-access", "conventions"]);
 		expect(selection.unmatched).toEqual([]);
-		expect(selection.entries.map((e) => e.id).sort()).toEqual(["conventions", "pi-mcp-adapter"]);
+		expect(selection.entries.map((e) => e.id).sort()).toEqual(["conventions", "pi-web-access"]);
 
 		// Also selectable by source alias
-		const aliasSelection = await extensions.select(["npm:pi-mcp-adapter"]);
-		expect(aliasSelection.entries.map((e) => e.id)).toEqual(["pi-mcp-adapter"]);
+		const aliasSelection = await extensions.select(["npm:pi-web-access"]);
+		expect(aliasSelection.entries.map((e) => e.id)).toEqual(["pi-web-access"]);
 	});
 
 	it("selects a directory-declared package entry", async () => {
@@ -338,7 +339,9 @@ describe("DiscoveredExtensions (pure discovery & selection)", () => {
 		await setConfiguredPackages([{ source: "npm:pi-multi", extensions: [] }]);
 		const extensions = await discoverExtensions({ cwd: fixture.cwd, agentDir: fixture.agentDir });
 
-		await expect(extensions.select(["pi-multi"])).rejects.toThrow(/declares no extension entries/);
+		const result = await extensions.select(["pi-multi"]);
+		expect(result.entries).toEqual([]);
+		expect(result.diagnostics?.[0].message).toMatch(/declares no extension entries/);
 	});
 
 	it("selects multi-entry packages as a whole and by individual entry", async () => {
@@ -353,40 +356,42 @@ describe("DiscoveredExtensions (pure discovery & selection)", () => {
 	});
 
 	it("expands glob patterns and records unmatched globs", async () => {
-		await addPackage("pi-mcp-adapter", { extensions: ["./index.ts"] });
+		await addPackage("pi-web-access", { extensions: ["./index.ts"] });
 		await addLoose(path.join(fixture.agentDir, "extensions"), "pi-guard.ts");
 		await addLoose(path.join(fixture.agentDir, "extensions"), "other.ts");
 
 		const extensions = await discoverExtensions({ cwd: fixture.cwd, agentDir: fixture.agentDir });
 
 		const selection = await extensions.select(["pi-*", "nonexistent-*"]);
-		expect(selection.entries.map((e) => e.id).sort()).toEqual(["pi-guard", "pi-mcp-adapter"]);
+		expect(selection.entries.map((e) => e.id).sort()).toEqual(["pi-guard", "pi-web-access"]);
 		expect(selection.unmatched).toEqual(["nonexistent-*"]);
 	});
 
-	it("resolves absolute paths directly, rejecting relative and missing ones", async () => {
+	it("resolves absolute paths directly, diagnosing relative and missing ones", async () => {
 		const absFile = await addLoose(path.join(fixture.root, "external"), "custom.ts");
 		const extensions = await discoverExtensions({ cwd: fixture.cwd, agentDir: fixture.agentDir });
 
 		const selection = await extensions.select([absFile]);
 		expect(selection.entries).toEqual([{ id: absFile, entry: absFile, origin: "path" }]);
 
-		await expect(extensions.select(["./relative/path.ts"])).rejects.toThrow(/relative path/);
-		await expect(extensions.select(["/nonexistent/ext.ts"])).rejects.toThrow(/extension path not found/);
+		const relative = await extensions.select(["./relative/path.ts"]);
+		expect(relative.entries).toEqual([]);
+		expect(relative.diagnostics?.[0].message).toContain("relative path");
+		const missing = await extensions.select(["/nonexistent/ext.ts"]);
+		expect(missing.entries).toEqual([]);
+		expect(missing.diagnostics?.[0].message).toContain("extension path not found");
 	});
 
-	it("fails on unknown literal with candidates and did-you-mean, never mentioning resources.json", async () => {
-		await addPackage("pi-mcp-adapter", { extensions: ["./index.ts"] });
+	it("diagnoses unknown literals with candidates and available near-miss hints", async () => {
+		await addPackage("pi-web-access", { extensions: ["./index.ts"] });
 		const extensions = await discoverExtensions({ cwd: fixture.cwd, agentDir: fixture.agentDir });
-
-		try {
-			await extensions.select(["pi-mcp-adaptr"]);
-			expect.unreachable("should have thrown");
-		} catch (err) {
-			const msg = (err as Error).message;
-			expect(msg).toContain("unknown extension");
-			expect(msg).not.toContain("resources.json");
-		}
+		const result = await extensions.select(["web-access"]);
+		expect(result.entries).toEqual([]);
+		const message = result.diagnostics?.[0].message;
+		expect(message).toContain("unknown extension");
+		expect(message).toContain("pi-web-access");
+		expect(message).toContain('did you mean "pi-web-access"');
+		expect(message).not.toContain("resources.json");
 	});
 
 	it("resolves local file over package name collision, keeping package selectable by source", async () => {
@@ -401,5 +406,52 @@ describe("DiscoveredExtensions (pure discovery & selection)", () => {
 
 		const pkgSelection = await extensions.select(["npm:my-tool"]);
 		expect(pkgSelection.entries[0]?.entry).toContain("node_modules");
+	});
+});
+
+
+describe("local extension reference diagnostics", () => {
+	it("continues past every expected reference failure without guessing a relative base", async () => {
+		await addPackage("empty-package", { extensions: ["./a.ts"] });
+		await setConfiguredPackages([{ source: "npm:empty-package", extensions: [] }]);
+		const file = await addLoose(path.join(fixture.root, "external"), "kept.ts");
+		const extensions = await discoverExtensions({ cwd: fixture.cwd, agentDir: fixture.agentDir });
+		const missing = path.join(fixture.root, "absent.ts");
+		const result = await extensions.select(["ghost", "relative.ts", "relative/path.ts", "../relative.ts", missing, "empty-package", "zero-*", file]);
+		expect(result.entries).toEqual([{ id: file, entry: file, origin: "path" }]);
+		expect(result.unmatched).toEqual(["zero-*"]);
+		expect(result.diagnostics?.map((issue) => issue.reference)).toEqual(["ghost", "relative.ts", "relative/path.ts", "../relative.ts", missing, "empty-package", "zero-*"]);
+		for (const issue of result.diagnostics ?? []) {
+			expect(issue.kind).toBe("extension");
+			expect(issue.message).toContain("not loaded");
+		}
+		expect(result.diagnostics?.find((issue) => issue.reference === missing)?.filePath).toBe(missing);
+	});
+
+	it("retries a missing path without mutating its references", async () => {
+		const extensions = await discoverExtensions({ cwd: fixture.cwd, agentDir: fixture.agentDir });
+		const file = path.join(fixture.root, "future.ts");
+		const refs = [file];
+		expect((await extensions.select(refs)).entries).toEqual([]);
+		await writeFile(file, 'throw new Error("must not execute")');
+		expect((await extensions.select(refs)).entries).toEqual([{ id: file, entry: file, origin: "path" }]);
+		expect(refs).toEqual([file]);
+	});
+
+	it("diagnoses glob-selected packages with no usable entries while retaining usable matches", async () => {
+		await addPackage("pi-empty", { extensions: ["./a.ts"] });
+		await addPackage("pi-usable", { extensions: ["./b.ts"] });
+		await setConfiguredPackages([{ source: "npm:pi-empty", extensions: [] }, "npm:pi-usable"]);
+		const extensions = await discoverExtensions({ cwd: fixture.cwd, agentDir: fixture.agentDir });
+		const result = await extensions.select(["pi-*"]);
+		expect(result.entries.map((entry) => entry.id)).toEqual(["pi-usable"]);
+		expect(result.diagnostics).toContainEqual(expect.objectContaining({ code: "empty-package", reference: "pi-*", message: expect.stringContaining("pi-empty") }));
+	});
+
+	it.skipIf(fileSymlinkUnavailable)("does not hide unexpected stat failures as missing references", async () => {
+		const extensions = await discoverExtensions({ cwd: fixture.cwd, agentDir: fixture.agentDir });
+		const file = path.join(fixture.root, "loop.ts");
+		await symlink(file, file);
+		await expect(extensions.select([file])).rejects.toMatchObject({ code: "ELOOP" });
 	});
 });

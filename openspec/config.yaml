@@ -3,7 +3,8 @@ schema: spec-driven
 context: |
   Project: pi-profile-switch, a Pi package. TypeScript ESM, Vitest, conventional commits.
 
-  Language: prose in English, technical terms kept as-is. Notation that OpenSpec parsing
+  Language: prose in English by default; the README editions follow the authoring
+  policy referenced below. Technical terms stay as-is. Notation that OpenSpec parsing
   depends on stays in its original English form:
   ## Purpose, ## ADDED/MODIFIED/REMOVED/RENAMED Requirements, ### Requirement:,
   #### Scenario:, SHALL/MUST. Terminology is defined by CONTEXT.md; the avoid-words
@@ -24,8 +25,12 @@ context: |
   - Hard to reverse, with an attractive rejected alternative → a new numbered file in docs/adr/
   - Product positioning, goals, non-goals → docs/prd.md
   - Terminology definitions → CONTEXT.md
-  - Install and command usage → README.md
-  When referencing facts owned elsewhere, link instead of restating.
+  - User-facing overview, installation, usage, and configuration guidance → README.md and README.zh-CN.md
+  When referencing facts owned elsewhere, link instead of restating, except that
+  README editions explain current behavior and necessary limits concisely for users.
+  These explanations derive from the owning contracts, product sources, and shipped
+  schema; the original sources retain authority.
+  README authoring principles are defined in AGENTS.md#readme-authoring.
 
 rules:
   proposal:

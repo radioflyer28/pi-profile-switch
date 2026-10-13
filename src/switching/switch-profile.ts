@@ -71,6 +71,11 @@ export interface SwitchDeps {
 	 *  skipped reload would be misreported as a successful switch. Optional
 	 *  for tests; always provided by the extension. */
 	assertStale?(): void;
+	/** Reports the actionable rollback cause before the rollback reload. The
+	 *  caller owns presentation; a reporter failure must not interrupt
+	 *  restoration or reload. Optional — without it the caller only sees the
+	 *  rejected `SwitchError`. */
+	reportFailure?(message: string): void;
 }
 
 export interface SwitchResult {
@@ -84,9 +89,11 @@ export interface SwitchResult {
  *  permission bits so restore doesn't widen a user-tightened mode. */
 type FileSnapshot =
 	| { kind: "absent" }
-	| { kind: "symlink"; target: string }
+	| { kind: "symlink"; target: string; type?: "junction" }
 	| { kind: "hardlink"; target: string }
-	| { kind: "file"; content: string; mode: number };
+	| { kind: "file"; content: string; mode: number }
+	/** Unsafe real content is never deleted or rewritten on restore. */
+	| { kind: "opaque" };
 
 interface RuntimeSnapshot {
 	settings: FileSnapshot;
@@ -94,6 +101,8 @@ interface RuntimeSnapshot {
 	mcp: FileSnapshot;
 	appendSystem: FileSnapshot;
 	trust: FileSnapshot;
+	/** The conditional managed extension link: absent or its raw symlink target. */
+	extensions: FileSnapshot;
 }
 
 /** Snapshots one managed runtime file. lstat (never stat) detects symlinks
@@ -125,6 +134,18 @@ async function snapshotFile(filePath: string, sharedTarget?: string): Promise<Fi
 	return { kind: "file", content: await readFile(filePath, "utf8"), mode: info.mode & 0o777 };
 }
 
+/** A managed directory link is snapshotted without reading its target.
+ * Unexpected real content is opaque and must survive a failed activation. */
+async function snapshotExtensionPath(filePath: string): Promise<FileSnapshot> {
+	const info = await lstat(filePath).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT") return null;
+		throw error;
+	});
+	if (info === null) return { kind: "absent" };
+	if (info.isSymbolicLink()) return { kind: "symlink", target: await readlink(filePath), ...(process.platform === "win32" ? { type: "junction" as const } : {}) };
+	return { kind: "opaque" };
+}
+
 async function snapshotRuntimeFiles(runtimeDir: string, realAgentDir: string): Promise<RuntimeSnapshot> {
 	return {
 		settings: await snapshotFile(path.join(runtimeDir, "settings.json")),
@@ -132,10 +153,12 @@ async function snapshotRuntimeFiles(runtimeDir: string, realAgentDir: string): P
 		mcp: await snapshotFile(path.join(runtimeDir, "mcp.json"), path.join(realAgentDir, "mcp.json")),
 		appendSystem: await snapshotFile(path.join(runtimeDir, "APPEND_SYSTEM.md")),
 		trust: await snapshotFile(path.join(runtimeDir, "trust.json"), path.join(realAgentDir, "trust.json")),
+		extensions: await snapshotExtensionPath(path.join(runtimeDir, "extensions")),
 	};
 }
 
 async function restoreFile(filePath: string, snapshot: FileSnapshot): Promise<void> {
+	if (snapshot.kind === "opaque") return;
 	if (snapshot.kind === "symlink") {
 		try {
 			if ((await lstat(filePath)).isSymbolicLink() && (await readlink(filePath)) === snapshot.target) return;
@@ -160,7 +183,7 @@ async function restoreFile(filePath: string, snapshot: FileSnapshot): Promise<vo
 	// failed switch into the user's real agent directory.
 	await rm(filePath, { force: true });
 	if (snapshot.kind === "symlink") {
-		await symlink(snapshot.target, filePath);
+		await symlink(snapshot.target, filePath, snapshot.type);
 	} else if (snapshot.kind === "hardlink") {
 		await link(snapshot.target, filePath);
 	} else if (snapshot.kind === "file") {
@@ -175,6 +198,9 @@ async function restoreRuntimeFiles(runtimeDir: string, snapshot: RuntimeSnapshot
 	await restoreFile(path.join(runtimeDir, "mcp.json"), snapshot.mcp);
 	await restoreFile(path.join(runtimeDir, "APPEND_SYSTEM.md"), snapshot.appendSystem);
 	await restoreFile(path.join(runtimeDir, "trust.json"), snapshot.trust);
+	// Restore the extension-path representation (absence or raw link target)
+	// before the rollback reload; the real resource directory is never touched.
+	await restoreFile(path.join(runtimeDir, "extensions"), snapshot.extensions);
 }
 
 /** Waits are delegated to Pi's native `ctx.waitForIdle()` (see SwitchDeps);
@@ -237,25 +263,22 @@ export async function switchProfile(
 					...(previousPlan.mcps !== undefined ? { mcps: previousPlan.mcps } : {}),
 				}
 			: undefined;
-	await writeRuntimeFiles(deps.runtimeDir, resolved.plan, {
-		agentDir: deps.realAgentDir,
-		platform: deps.platform,
-		projectDir: resolved.projectDir,
-		discovery: resolved.discovery,
-		planExtras: {
-			...(isSwitch && current.profile !== undefined ? { switchedFrom: current.profile } : {}),
-			// `/profile use` persists; `/profile reload` keeps the current
-			// profile's existing persistence (launch selections stay transient).
-			persistSelection: options?.reloadCurrent === true ? current.persistSelection : true,
-			// A switch discards the previous profile's overlay; the post-reload
-			// instance drops it from the state file. Customize/reset manage the
-			// overlay directly and never set this.
-			...(options?.clearOverlay === true ? { clearOverlay: true } : {}),
-			...(previousResolved !== undefined ? { previousResolved } : {}),
-		},
-	});
+	// Generation owns the final structured diagnostic snapshot. Keep only
+	// plain resolution warnings here; otherwise refreshed or cleared MCP
+	// diagnostics would resurrect earlier candidate messages after reload.
+	const structuredResolutionWarnings = new Set((resolved.plan.diagnostics ?? []).map((issue) => issue.message));
+	const warnings = resolved.warnings.filter((message) => !structuredResolutionWarnings.has(message));
 
 	const rollback = async (cause: string): Promise<never> => {
+		const message = `activation of profile "${target}" failed; restored the previous settings. Cause: ${cause}`;
+		// Report the actionable cause before the rollback reload invalidates the
+		// caller's command context; a reporter failure must never prevent
+		// restoration or reload.
+		try {
+			deps.reportFailure?.(message);
+		} catch {
+			// Presentation must not block rollback.
+		}
 		// Restore the verified snapshot and reload again — the runtime must
 		// never sit half-switched. State files were not written yet (the
 		// post-reload extension instance owns them), so nothing else moved.
@@ -265,12 +288,30 @@ export async function switchProfile(
 		} catch {
 			// The restore reload failing too is reported through the original error.
 		}
-		throw new SwitchError(
-			`activation of profile "${target}" failed; restored the previous settings. Cause: ${cause}`,
-		);
+		throw new SwitchError(message);
 	};
 
+	// The write-and-reload interval is one rollback boundary: a failure in any
+	// write after the first, or in reload, restores every managed file (D3).
 	try {
+		const written = await writeRuntimeFiles(deps.runtimeDir, resolved.plan, {
+			agentDir: deps.realAgentDir,
+			platform: deps.platform,
+			projectDir: resolved.projectDir,
+			discovery: resolved.discovery,
+			planExtras: {
+				...(isSwitch && current.profile !== undefined ? { switchedFrom: current.profile } : {}),
+				// `/profile use` persists; `/profile reload` keeps the current
+				// profile's existing persistence (launch selections stay transient).
+				persistSelection: options?.reloadCurrent === true ? current.persistSelection : true,
+				// A switch discards the previous profile's overlay; the post-reload
+				// instance drops it from the state file. Customize/reset manage the
+				// overlay directly and never set this.
+				...(options?.clearOverlay === true ? { clearOverlay: true } : {}),
+				...(previousResolved !== undefined ? { previousResolved } : {}),
+			},
+		});
+		warnings.push(...written.warnings);
 		await deps.reload();
 	} catch (error) {
 		await rollback(error instanceof Error ? error.message : String(error));
@@ -291,5 +332,5 @@ export async function switchProfile(
 		}
 	}
 
-	return { profile: resolved.plan.profile, warnings: resolved.warnings };
+	return { profile: resolved.plan.profile, warnings: [...new Set(warnings)] };
 }

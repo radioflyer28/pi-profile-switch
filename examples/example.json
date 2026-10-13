@@ -3,11 +3,7 @@
   "description": "Full-powered implementation profile: every available field, pinned model",
   "skills": [
     "tdd",
-    "internal-*",
-    "mcp-scripting"
-  ],
-  "extensions": [
-    "pi-mcp-adapter"
+    "internal-*"
   ],
   "mcps": [
     "github",
@@ -20,13 +16,27 @@
     "ls",
     "bash",
     "edit",
-    "write",
-    "mcp__*",
-    "github_*",
-    "linear_*"
+    "write"
   ],
+  "mcp_tools": {
+    "github": [
+      "search",
+      "get_issue"
+    ],
+    "linear": []
+  },
   "defaultProvider": "anthropic",
   "defaultModel": "claude-sonnet-4-5",
   "defaultThinkingLevel": "high",
-  "instructions": "Prefer small, verifiable changes. Run the test suite before claiming completion."
+  "instructions": "Prefer small, verifiable changes. Run the test suite before claiming completion.",
+  "subagents": {
+    "defaultModel": "anthropic/claude-sonnet-4-5",
+    "agentOverrides": {
+      "reviewer": {
+        "thinking": "high",
+        "description": "Independent review for this project",
+        "advertise": true
+      }
+    }
+  }
 }

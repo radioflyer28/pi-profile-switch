@@ -2,13 +2,9 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import {
-	LAUNCHER_BIN as BIN,
-	launcherEnv,
-	runLauncher,
-} from "./helpers/launcher-runner.ts";
+import { runLauncher, runLauncherRpc } from "./helpers/launcher-runner.ts";
+import { runNativePi } from "./helpers/native-pi-runner.ts";
 import { addGlobalSkill, createPiFixture, listFiles, type PiFixture } from "./helpers/pi-fixture.ts";
-import { RpcDriver } from "./helpers/rpc-driver.ts";
 
 let fixture: PiFixture;
 
@@ -72,10 +68,7 @@ describe("launcher integration: named global profiles", () => {
 			});
 			void unregisteredEntry;
 
-			const rpc = new RpcDriver("node", [BIN, "review", "--", "--mode", "rpc"], {
-				cwd: fixture.cwd,
-				env: launcherEnv(fixture),
-			});
+			const rpc = runLauncherRpc(fixture, ["review", "--", "--mode", "rpc"]);
 			try {
 				const commands = await rpc.commandNames();
 				const names = commands.map((command) => command.name);
@@ -99,6 +92,31 @@ describe("launcher integration: named global profiles", () => {
 	);
 
 	it(
+		"keeps skills hidden by the user's own settings exclusions hidden",
+		{ timeout: 45_000 },
+		async () => {
+			await addGlobalSkill(fixture, "kept-skill");
+			await addGlobalSkill(fixture, "hidden-skill");
+			await addAgentsSkill("hidden-agents-skill");
+			await writeFile(
+				path.join(fixture.agentDir, "settings.json"),
+				JSON.stringify({ skills: ["!skills/**", "+skills/kept-skill/SKILL.md"] }),
+			);
+			await writeCatalog({ review: { skills: ["*"] } });
+
+			const rpc = runLauncherRpc(fixture, ["review", "--", "--mode", "rpc"]);
+			try {
+				const names = await rpc.skillCommandNames();
+				expect(names).toContain("skill:kept-skill");
+				expect(names).not.toContain("skill:hidden-skill");
+				expect(names).not.toContain("skill:hidden-agents-skill");
+			} catch(e) { console.error("STDERR:", rpc.stderr); throw e; } finally {
+				await rpc.close();
+			}
+		},
+	);
+
+	it(
 		"restores the saved active profile when no positional name is given",
 		{ timeout: 45_000 },
 		async () => {
@@ -110,7 +128,7 @@ describe("launcher integration: named global profiles", () => {
 				JSON.stringify({ activeProfile: "review" }),
 			);
 
-			const rpc = new RpcDriver("node", [BIN, "--", "--mode", "rpc"], { cwd: fixture.cwd, env: launcherEnv(fixture) });
+			const rpc = runLauncherRpc(fixture, ["--", "--mode", "rpc"]);
 			try {
 				const names = await rpc.skillCommandNames();
 				expect(names).toContain("skill:alpha-skill");
@@ -128,10 +146,7 @@ describe("launcher integration: named global profiles", () => {
 			await addGlobalSkill(fixture, "research-web");
 			await writeCatalog({ research: { skills: ["research-*"] } });
 
-			const first = new RpcDriver("node", [BIN, "research", "--", "--mode", "rpc"], {
-				cwd: fixture.cwd,
-				env: launcherEnv(fixture),
-			});
+			const first = runLauncherRpc(fixture, ["research", "--", "--mode", "rpc"]);
 			try {
 				expect(await first.skillCommandNames()).toEqual(["skill:research-web"]);
 			} catch(e) { console.error("STDERR:", first.stderr); throw e; } finally {
@@ -140,10 +155,7 @@ describe("launcher integration: named global profiles", () => {
 
 			// A new matching skill appears after the first launch resolved the glob.
 			await addGlobalSkill(fixture, "research-docs");
-			const second = new RpcDriver("node", [BIN, "research", "--", "--mode", "rpc"], {
-				cwd: fixture.cwd,
-				env: launcherEnv(fixture),
-			});
+			const second = runLauncherRpc(fixture, ["research", "--", "--mode", "rpc"]);
 			try {
 				expect(await second.skillCommandNames()).toEqual(["skill:research-docs", "skill:research-web"]);
 			} catch(e) { console.error("STDERR:", second.stderr); throw e; } finally {
@@ -171,10 +183,7 @@ describe("launcher integration: named global profiles", () => {
 			);
 			await writeCatalog({ focused: { defaultProvider: "testprov", defaultModel: "test-model", defaultThinkingLevel: "high" } });
 
-			const rpc = new RpcDriver("node", [BIN, "focused", "--", "--mode", "rpc"], {
-				cwd: fixture.cwd,
-				env: launcherEnv(fixture),
-			});
+			const rpc = runLauncherRpc(fixture, ["focused", "--", "--mode", "rpc"]);
 			try {
 				const state = await rpc.send({ type: "get_state" });
 				const model = state.data?.model as { provider: string; id: string } | undefined;
@@ -227,10 +236,7 @@ describe("launcher integration: named global profiles", () => {
 				].join("\n"),
 			);
 
-			const rpc = new RpcDriver("node", [BIN, "review", "--", "--mode", "rpc", "-e", probe], {
-				cwd: fixture.cwd,
-				env: launcherEnv(fixture),
-			});
+			const rpc = runLauncherRpc(fixture, ["review", "--", "--mode", "rpc", "-e", probe]);
 			try {
 				// The prompt fails fast (unreachable fixture provider, retries off),
 				// but before_agent_start has already fired by then.
@@ -248,31 +254,27 @@ describe("launcher integration: named global profiles", () => {
 		},
 	);
 
-	it(
-		"fails activation before spawn when the declared model is unauthenticated",
-		{ timeout: 30_000 },
-		async () => {
-			await writeCatalog({ broken: { defaultProvider: "anthropic", defaultModel: "claude-sonnet-4-5" } });
-
-			const failure = await runLauncher(fixture, ["broken", "--", "--mode", "rpc"]);
-
-			expect(failure.code).toBe(2);
-			expect(failure.stderr).toContain("anthropic");
-			// No runtime dir was generated: resolution failed before spawn.
-			const files = await listFiles(fixture.agentDir);
-			expect(files.filter((file) => path.relative(fixture.agentDir, file).startsWith("pi-profile"))).toEqual([]);
-		},
-	);
+	it("delegates an unauthenticated declaration to equivalent native Pi behavior", { timeout: 45_000 }, async () => {
+		const declaration = { defaultProvider: "anthropic", defaultModel: "claude-sonnet-4-5" };
+		await writeCatalog({ broken: declaration });
+		await writeFile(path.join(fixture.agentDir, "settings.json"), JSON.stringify(declaration));
+		const native = await runNativePi(fixture, ["--mode", "rpc"]);
+		await writeFile(path.join(fixture.agentDir, "settings.json"), "{}");
+		const actual = await runLauncher(fixture, ["broken", "--", "--mode", "rpc"]);
+		expect(actual.code).toBe(native.code);
+		expect(native.signal).toBeNull();
+		expect(actual.stderr).not.toMatch(/pi-profile:.*(?:credentials|model.*validat)/i);
+	});
 
 	it(
-		"fails activation before spawn on an unknown extension reference",
+		"warns and starts with an empty effective unknown-extension selection",
 		{ timeout: 30_000 },
 		async () => {
 			await writeCatalog({ review: { extensions: ["nonexistent-ext"] } });
 
 			const failure = await runLauncher(fixture, ["review", "--", "--mode", "rpc"]);
 
-			expect(failure.code).toBe(2);
+			expect(failure.code).toBe(0);
 			expect(failure.stderr).toContain('unknown extension: "nonexistent-ext"');
 		},
 	);
@@ -287,10 +289,7 @@ describe("launcher integration: named global profiles", () => {
 			await writeFile(path.join(fixture.agentDir, "settings.json"), JSON.stringify(userSettings));
 			const agentDirBefore = await listFiles(fixture.agentDir);
 
-			const rpc = new RpcDriver("node", [BIN, "review", "--", "--mode", "rpc"], {
-				cwd: fixture.cwd,
-				env: launcherEnv(fixture),
-			});
+			const rpc = runLauncherRpc(fixture, ["review", "--", "--mode", "rpc"]);
 			try {
 				await rpc.commandNames();
 			} catch(e) { console.error("STDERR:", rpc.stderr); throw e; } finally {
@@ -316,4 +315,51 @@ describe("launcher integration: named global profiles", () => {
 			expect(files.filter((file) => file.endsWith("pi-profile-state.json"))).toEqual([]);
 		},
 	);
+});
+
+
+describe("real restrictive partial resource discovery", () => {
+	it.each([false, true])("keeps missing-only/partial user selections restrictive (partial=%s), preserves project resources and source files", { timeout: 90_000 }, async (partial) => {
+		await addGlobalSkill(fixture, "selected-skill"); await addGlobalSkill(fixture, "unselected-skill");
+		await addAgentsSkill("unselected-home");
+		await addExtensionEntry("selected-ext"); await addExtensionEntry("unselected-ext");
+		const pkg = path.join(fixture.root, "resource-package");
+		await mkdir(path.join(pkg, "skills", "package-skill"), { recursive: true });
+		await writeFile(path.join(pkg, "skills", "package-skill", "SKILL.md"), "---\nname: package-skill\ndescription: package skill\n---\n");
+		await writeFile(path.join(pkg, "index.ts"), `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(path.join(fixture.root, "EXECUTED-package-ext"))}, "ran"); export default function(pi) { pi.registerCommand("package-ext", { handler: async () => {} }); }`);
+		await writeFile(path.join(pkg, "package.json"), JSON.stringify({ name: "resource-package", version: "1.0.0", pi: { extensions: ["./index.ts"], skills: ["./skills"] } }));
+		const settingsFile = path.join(fixture.agentDir, "settings.json");
+		const settings = JSON.stringify({ packages: [pkg], customKey: "unchanged" });
+		await writeFile(settingsFile, settings);
+		const projectSkill = path.join(fixture.cwd, ".pi", "skills", "project-skill");
+		await mkdir(projectSkill, { recursive: true });
+		await writeFile(path.join(projectSkill, "SKILL.md"), "---\nname: project-skill\ndescription: project skill\n---\n");
+		await mkdir(path.join(fixture.cwd, ".pi", "extensions"), { recursive: true });
+		await writeFile(path.join(fixture.cwd, ".pi", "extensions", "project-ext.ts"), 'export default function(pi) { pi.registerCommand("project-ext", { handler: async () => {} }); }');
+		await writeFile(path.join(fixture.agentDir, "trust.json"), JSON.stringify({ [fixture.cwd]: true }));
+		await writeCatalog({ partial: { skills: ["missing-skill", ...(partial ? ["selected-skill"] : [])], extensions: ["missing-ext", ...(partial ? ["selected-ext"] : [])] }, invalid: { skills: 1 } });
+		const dir = path.join(fixture.profileSwitchDir, "profiles");
+		await writeFile(path.join(dir, "corrupt.json"), "{ bad"); await writeFile(path.join(dir, "default.json"), "{ bad");
+		const profileFile = path.join(dir, "partial.json"); const original = await readFile(profileFile, "utf8");
+		const output = await runLauncher(fixture, ["partial", "--", "--mode", "rpc"]);
+		expect(output.code).toBe(0);
+		for (const line of output.stdout.split("\n").filter(Boolean)) expect(() => JSON.parse(line)).not.toThrow();
+		expect(output.stdout).not.toMatch(/unknown skill|unknown extension|pi-profile: warning/);
+		for (const reference of ["missing-skill", "missing-ext"]) expect(output.stderr.split("\n").filter((line) => line.includes("pi-profile: warning:") && line.includes(`"${reference}"`))).toHaveLength(1);
+		const rpc = runLauncherRpc(fixture, ["partial", "--", "--mode", "rpc"]);
+		try {
+			const names = (await rpc.commandNames()).map((entry) => entry.name);
+			expect(names).toContain("skill:project-skill"); expect(names).toContain("project-ext");
+			for (const name of ["skill:unselected-skill", "skill:unselected-home", "skill:package-skill", "package-ext", "unselected-ext"]) expect(names).not.toContain(name);
+			if (partial) { expect(names).toContain("skill:selected-skill"); expect(names).toContain("selected-ext"); }
+			else { expect(names).not.toContain("skill:selected-skill"); expect(names).not.toContain("selected-ext"); }
+		} finally { await rpc.close(); await rpc.waitForExit(); }
+		const { existsSync } = await import("node:fs");
+		expect(existsSync(path.join(fixture.root, "EXECUTED-unselected-ext"))).toBe(false);
+		expect(existsSync(path.join(fixture.root, "EXECUTED-package-ext"))).toBe(false);
+		expect(existsSync(path.join(fixture.root, "EXECUTED-selected-ext"))).toBe(partial);
+		expect(await readFile(profileFile, "utf8")).toBe(original);
+		expect(await readFile(settingsFile, "utf8")).toBe(settings);
+		expect(await readFile(path.join(dir, "corrupt.json"), "utf8")).toBe("{ bad");
+	});
 });

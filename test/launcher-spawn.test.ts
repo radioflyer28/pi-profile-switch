@@ -11,6 +11,7 @@ const generated: GeneratedRuntime = {
 	runtimeDir: "/tmp/runtime",
 	env: { PI_CODING_AGENT_DIR: "/tmp/runtime" },
 	agentDir: "/tmp/agent",
+	warnings: [],
 };
 
 describe("buildPiArgs", () => {
@@ -43,7 +44,7 @@ describe("buildPiArgs", () => {
 		try {
 			await expect(
 				spawnPi({
-					generated: { runtimeDir, agentDir, env: { PI_CODING_AGENT_DIR: runtimeDir } },
+					generated: { runtimeDir, agentDir, env: { PI_CODING_AGENT_DIR: runtimeDir }, warnings: [] },
 					piArgs: ["literal & exit /b 99"],
 					trustOverride: undefined,
 				}),
@@ -70,6 +71,7 @@ describe("buildPiArgs", () => {
 			const result = await reconcileGeneratedRuntime({
 				runtimeDir,
 				agentDir,
+				warnings: [],
 				env: { PI_CODING_AGENT_DIR: runtimeDir },
 			});
 

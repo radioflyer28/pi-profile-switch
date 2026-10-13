@@ -139,7 +139,7 @@ describe("applyOverlayMutation / clearOverlay", () => {
 		await applyOverlayMutation(deps(), mutate("disable skill beta-skill"));
 
 		const settings = await readSettings();
-		expect(settings.skills).toEqual([path.join(fixture.agentDir, "skills", "alpha-skill", "SKILL.md"), `-${path.join(runtimeDir, "skills", "beta-skill", "SKILL.md")}`]);
+		expect(settings.skills).toEqual([path.join(fixture.agentDir, "skills", "alpha-skill", "SKILL.md"), `-${path.join(runtimeDir, "skills", "beta-skill", "SKILL.md")}`, `-${path.join(fixture.agentDir, "skills", "beta-skill", "SKILL.md")}`]);
 		expect((await readState()).overlay).toEqual({ disabledSkills: ["beta-skill"] });
 		// The catalog file is untouched.
 		const profile = JSON.parse(await readFile(path.join(fixture.profileSwitchDir, "profiles", "review.json"), "utf8"));
@@ -212,7 +212,7 @@ describe("applyOverlayMutation / clearOverlay", () => {
 		await switchProfile(undefined, deps(), { reloadCurrent: true });
 
 		const settings = await readSettings();
-		expect(settings.skills).toEqual([path.join(fixture.agentDir, "skills", "alpha-skill", "SKILL.md"), `-${path.join(runtimeDir, "skills", "beta-skill", "SKILL.md")}`]);
+		expect(settings.skills).toEqual([path.join(fixture.agentDir, "skills", "alpha-skill", "SKILL.md"), `-${path.join(runtimeDir, "skills", "beta-skill", "SKILL.md")}`, `-${path.join(fixture.agentDir, "skills", "beta-skill", "SKILL.md")}`]);
 		expect((await readState()).overlay).toEqual({ disabledSkills: ["beta-skill"] });
 	});
 
@@ -258,8 +258,13 @@ describe("applyOverlayMutation / clearOverlay", () => {
 
 		await applyOverlayMutation(deps(), mutate("disable skill beta-skill"));
 
+		// Undeclared skills: the agentDir mirror keeps the remaining native skills
+		// discoverable, and only the disabled entry is force-excluded.
 		const settings = await readSettings();
-		expect(settings.skills).toEqual([path.join(fixture.agentDir, "skills", "alpha-skill", "SKILL.md"), `-${path.join(runtimeDir, "skills", "beta-skill", "SKILL.md")}`]);
+		expect(settings.skills).toEqual([
+			`-${path.join(runtimeDir, "skills", "beta-skill", "SKILL.md")}`,
+			`-${path.join(fixture.agentDir, "skills", "beta-skill", "SKILL.md")}`,
+		]);
 		expect(settings.defaultProjectTrust).toBe("never");
 	});
 });

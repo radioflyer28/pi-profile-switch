@@ -10,16 +10,22 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { installDefaultProfiles, installProfileConfigSkill } from "../bin/postinstall.js";
+import { createRequire } from "node:module";
+// The plain synchronous ESM hook needs no Vitest/hashbang transform.
+const { installDefaultProfiles, installProfileConfigSkill } = createRequire(import.meta.url)(path.resolve("bin/postinstall.js")) as typeof import("../bin/postinstall.js");
 
 let root: string;
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "pi-profile-postinstall-"));
+	// Installer tests must never write to the operator's actual home directory.
+	vi.stubEnv("HOME", root);
+	vi.stubEnv("USERPROFILE", root);
 });
 
 afterEach(async () => {
-	await rm(root, { recursive: true, force: true });
+	try { await rm(root, { recursive: true, force: true }); }
+	finally { vi.unstubAllEnvs(); }
 });
 
 function envFor(dir: string): NodeJS.ProcessEnv {

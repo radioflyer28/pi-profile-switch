@@ -1,3 +1,5 @@
+**Superseded by ADR-0016.**
+
 # MCP integration locked to pi-mcp-adapter
 
 ## Context

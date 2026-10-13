@@ -1,4 +1,4 @@
-**Superseded by ADR-0015.**
+**Superseded by ADR-0019.**
 
 # Instance lifecycle bound to one launch
 

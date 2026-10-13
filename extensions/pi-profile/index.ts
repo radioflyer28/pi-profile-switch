@@ -6,13 +6,15 @@ import { fileURLToPath } from "node:url";
 
 import { isRecord } from "../../src/json-file.ts";
 import { readTrustInputs } from "../../src/launcher/initial-profile.ts";
-import { discoverAdapterServerNames } from "../../src/mcp-config.ts";
+import { loadMergedMcpServers } from "../../src/mcp-config.ts";
+import { mergeResolutionDiagnostics, mcpSourceDiagnostics } from "../../src/profile-resolver.ts";
 import { RuntimeStateStore } from "../../src/runtime-state-store.ts";
 import { runStartupNotifications, type NoticeSurface } from "../../src/startup-notifier.ts";
 import { applyLaunchPlan, readLaunchPlanFile } from "../../src/switching/apply-plan.ts";
 import { OVERLAY_USAGE, applyOverlayMutation, clearOverlay, parseOverlayArgs } from "../../src/switching/overlay.ts";
 import { formatProfileList, listProfiles } from "../../src/switching/list-profiles.ts";
 import { buildStatusReport, formatStatusMarkdown } from "../../src/switching/status.ts";
+import { observeSubagentExtension } from "../../src/switching/subagent-observation.ts";
 import { switchProfile, type SwitchDeps } from "../../src/switching/switch-profile.ts";
 import { getGlobalStateDir, getProfileSwitchDir } from "../../src/workspace.ts";
 
@@ -95,10 +97,38 @@ async function startStartupNotices(surface: NoticeSurface): Promise<void> {
 	}
 }
 
+async function observeRegisteredSubagents(pi: ExtensionAPI): Promise<"detected" | "unconfirmed"> {
+	try {
+		return await observeSubagentExtension([...pi.getAllTools(), ...pi.getCommands()]);
+	} catch {
+		return "unconfirmed";
+	}
+}
+
 function setProfileStatus(ui: unknown, profile: string | undefined): void {
 	if (profile && typeof (ui as { setStatus?: (k: string, v: string) => void })?.setStatus === "function") {
 		(ui as { setStatus: (k: string, v: string) => void }).setStatus("profile", `profile: ${profile}`);
 	}
+}
+
+/** Reports an activation failure through the current UI, falling back to
+ *  stderr when the UI is absent or the command context is already stale.
+ *  Unlike the success channel, a failure must not vanish after the rollback
+ *  reload, so a stale context falls back to stderr instead of being
+ *  swallowed. */
+function reportActivationFailure(
+	ctx: { ui?: { notify?(message: string, level: "error" | "info" | "warning"): void } },
+	message: string,
+): void {
+	try {
+		if (ctx.ui?.notify !== undefined) {
+			ctx.ui.notify(message, "error");
+			return;
+		}
+	} catch {
+		// The command context was invalidated by a reload: fall through to stderr.
+	}
+	process.stderr.write(`pi-profile: ${message}\n`);
 }
 
 export default function piProfileExtension(pi: ExtensionAPI): void {
@@ -122,6 +152,9 @@ export default function piProfileExtension(pi: ExtensionAPI): void {
 				getAllTools: () => pi.getAllTools(),
 				setActiveTools: (names) => pi.setActiveTools(names),
 				notify: (message, level) => ctx.ui?.notify(message, level),
+				getCommands: () => pi.getCommands(),
+				observeSubagents: () => observeRegisteredSubagents(pi),
+				notifySubagentWarning: (message) => noticeSurface.display(message, "warning"),
 			},
 		});
 		pendingSummary = result.summary;
@@ -148,12 +181,21 @@ export default function piProfileExtension(pi: ExtensionAPI): void {
 			// invalidated and property access throws. Post-reload feedback is
 			// the new instance's job (session_start summary), so swallowed
 			// stale-ctx failures lose nothing the user would otherwise see.
+			const ui = ctx.ui;
 			const notify = (message: string, level: "info" | "warning" | "error") => {
 				try {
-					ctx.ui?.notify(message, level);
+					ui?.notify(message, level);
 				} catch {
 					// stale context after reload — see above
 				}
+			};
+			const notifySwitchWarnings = async (result: { profile: string; warnings: string[] }): Promise<void> => {
+				// switchProfile returns final-stage structured messages only, not
+				// superseded resolution messages. Successful reload delivered these
+				// persisted issues; unmatched plain/legacy warnings remain observable.
+				const next = await readLaunchPlanFile(runtimeDir);
+				const delivered = new Set(next?.profile === result.profile ? (next.diagnostics ?? []).map((issue) => issue.message) : []);
+				for (const warning of new Set(result.warnings)) if (!delivered.has(warning)) notify(warning, "warning");
 			};
 			const usage = `usage: /profile [use <name> | reload | status | ${OVERLAY_USAGE}]`;
 			if (subcommand === "use" && rest.length === 0) {
@@ -186,18 +228,21 @@ export default function piProfileExtension(pi: ExtensionAPI): void {
 					assertStale: () => {
 						void ctx.cwd;
 					},
+					// Deliver the actionable failure cause before the rollback
+					// reload invalidates this context; fall back to stderr otherwise.
+					reportFailure: (message) => reportActivationFailure(ctx, message),
 				};
 				if (subcommand === "use") {
 					const result = await switchProfile(rest[0], deps, { clearOverlay: true });
-					for (const warning of result.warnings) notify(warning, "warning");
-					setProfileStatus(ctx.ui, result.profile);
+					await notifySwitchWarnings(result);
+					setProfileStatus(ui, result.profile);
 					notify(`profile active: ${result.profile}`, "info");
 					return;
 				}
 				if (subcommand === "reload") {
 					const result = await switchProfile(undefined, deps, { reloadCurrent: true });
-					for (const warning of result.warnings) notify(warning, "warning");
-					setProfileStatus(ctx.ui, result.profile);
+					await notifySwitchWarnings(result);
+					setProfileStatus(ui, result.profile);
 					notify(`profile reloaded: ${result.profile}`, "info");
 					return;
 				}
@@ -205,29 +250,39 @@ export default function piProfileExtension(pi: ExtensionAPI): void {
 					const command = parseOverlayArgs(rest.join(" "));
 					if (command.kind === "clear") {
 						const result = await clearOverlay(deps);
-						for (const warning of result.warnings) notify(warning, "warning");
+						await notifySwitchWarnings(result);
 						notify(`overlay cleared: ${result.profile}`, "info");
 						return;
 					}
 					const result = await applyOverlayMutation(deps, command.mutate);
-					for (const warning of result.warnings) notify(warning, "warning");
+					await notifySwitchWarnings(result);
 					notify(`overlay updated: ${result.profile}`, "info");
 					return;
 				}
 				// Observability surface (ticket 07): bare /profile opens the
 				// selector; status renders via a displayed custom message.
-				const entries = await listProfiles({ realAgentDir: plan.agentDir, cwd: ctx.cwd });
 				if (subcommand === "status") {
 					const { projectTrusted } = await readTrustInputs({ agentDir: plan.agentDir, cwd: ctx.cwd });
 					const stateDir = plan.source === "project" ? path.join(ctx.cwd, ".pi") : getGlobalStateDir(plan.agentDir);
 					const state = await new RuntimeStateStore(stateDir).read();
+					const mcpDiscovery = await loadMergedMcpServers(
+						plan.agentDir,
+						projectTrusted ? ctx.cwd : undefined,
+						{ invalidSource: "diagnose" },
+					);
+					const discoveredMcpServers = Object.keys(mcpDiscovery.servers).sort();
+					const disabledMcpServers = discoveredMcpServers.filter(
+						(server) => mcpDiscovery.servers[server]?.enabled === false,
+					);
 					const report = buildStatusReport({
-						plan,
+						plan: { ...plan, diagnostics: mergeResolutionDiagnostics(plan.diagnostics, mcpSourceDiagnostics(plan.profile, mcpDiscovery.diagnostics)) },
+						...(plan.subagents !== undefined
+							? { subagentObservation: await observeRegisteredSubagents(pi) }
+							: {}),
 						overlay: state.overlay,
-						discoveredMcpServers: await discoverAdapterServerNames(
-							plan.agentDir,
-							projectTrusted ? ctx.cwd : undefined,
-						),
+						discoveredMcpServers,
+						disabledMcpServers,
+						projectMcpServers: [...mcpDiscovery.projectServers].sort(),
 						commands: pi.getCommands(),
 						tools: pi.getAllTools(),
 					});
@@ -241,6 +296,8 @@ export default function piProfileExtension(pi: ExtensionAPI): void {
 					});
 					return;
 				}
+				const catalogDiagnostics: string[] = [];
+				const entries = await listProfiles({ realAgentDir: plan.agentDir, cwd: ctx.cwd, onDiagnostic: (message) => catalogDiagnostics.push(message) });
 				// Bare /profile: the interactive selector. Degradation boundary
 				// (delta "Observability surface"): outside TUI mode the selector
 				// does not run — the bare invocation degrades to the trust-gated
@@ -249,25 +306,35 @@ export default function piProfileExtension(pi: ExtensionAPI): void {
 				if (!ctx.hasUI || ctx.mode !== "tui") {
 					pi.sendMessage({
 						customType: "pi-profile",
-						content: formatProfileList(entries, plan.profile),
+						content: [formatProfileList(entries, plan.profile), ...catalogDiagnostics.map((message) => `warning: ${message}`)].join("\n"),
 						display: true,
-						details: { kind: "list", profiles: entries },
+						details: { kind: "list", profiles: entries, ...(catalogDiagnostics.length > 0 ? { diagnostics: catalogDiagnostics } : {}) },
 					});
 					return;
 				}
+				for (const diagnostic of catalogDiagnostics) notify(diagnostic, "warning");
+				for (const entry of entries) {
+					if (!entry.available) notify(`${entry.name} [${entry.source}] — unavailable: ${entry.error}`, "error");
+					for (const warning of entry.warnings ?? []) notify(warning, "warning");
+				}
 				const choice = await ctx.ui.select(
 					"select a profile",
-						entries.map((entry) => {
+						entries.filter((entry) => entry.available).map((entry) => {
 						const label = entry.label ?? entry.description;
 						return `${entry.name} [${entry.source}]${label !== undefined ? ` — ${label}` : ""}`;
 					}),
 				);
 				if (choice === undefined) return; // cancelled
 				const chosen = choice.split(" [")[0] ?? choice;
+				const selected = entries.find((entry) => entry.name === chosen);
+				if (selected?.available !== true) {
+					notify(selected?.error ?? `profile "${chosen}" is not selectable; choose an available profile`, "error");
+					return;
+				}
 				if (chosen === plan.profile) return;
 				const switched = await switchProfile(chosen, deps, { clearOverlay: true });
-				for (const warning of switched.warnings) notify(warning, "warning");
-				setProfileStatus(ctx.ui, switched.profile);
+				await notifySwitchWarnings(switched);
+				setProfileStatus(ui, switched.profile);
 			} catch (error) {
 				notify(error instanceof Error ? error.message : String(error), "error");
 			}

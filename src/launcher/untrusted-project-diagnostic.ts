@@ -77,7 +77,7 @@ export function untrustedProjectDiagnostic(cwd: string, projectTrusted: boolean)
 		return undefined;
 	}
 	return (
-		`project is untrusted; skipped project content is invisible to this launch: ${skipped.join(", ")}. ` +
+		`project is untrusted; skipped project content is invisible to this launch: ${skipped.map((entry) => entry.split(path.sep).join("/")).join(", ")}. ` +
 		'To authorize it, run "/trust" in Pi to persist the decision (effective on the next launch), ' +
 		'or relaunch with "-- --approve" to grant one-shot trust for this launch.'
 	);

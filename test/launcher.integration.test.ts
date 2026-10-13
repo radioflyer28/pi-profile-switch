@@ -179,7 +179,7 @@ describe("launcher integration: instance dir cleanup", () => {
 					expect(stderr).toContain(`${previousPath} was not reclaimed`);
 					expect(afterSecond).toHaveLength(2);
 				} else {
-					expect(stderr).not.toContain(previousPath);
+					expect(stderr).not.toContain(`${previousPath} was not reclaimed`);
 					expect(afterSecond).toHaveLength(1);
 				}
 			} finally {
@@ -370,4 +370,67 @@ describe("launcher integration: startup notifications", () => {
 			expect(history.keys).toContain(`upgrade:${newerTarget}`);
 		},
 	);
+});
+
+
+describe("launcher integration: selected catalog validation", () => {
+	async function profileFile(name: string, content: string): Promise<string> {
+		const dir = path.join(fixture.profileSwitchDir, "profiles");
+		await mkdir(dir, { recursive: true });
+		const file = path.join(dir, `${name}.json`);
+		await writeFile(file, content);
+		return file;
+	}
+
+	it("spawns Pi for a valid profile despite unrelated corrupt and invalid definitions", { timeout: 45_000 }, async () => {
+		await profileFile("review", '{"skills":["alpha-skill"]}');
+		await profileFile("corrupt", "{ bad");
+		await profileFile("invalid", '{"skills":1}');
+		const output = await runLauncher(fixture, ["review", "--", "--version"]);
+		expect(output.code).toBe(0);
+		expect(output.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+		expect(output.stderr).not.toContain("corrupt.json");
+		expect(output.stderr).not.toContain("invalid.json");
+	});
+
+	it("spawns default despite corrupt entries and a reserved default file", { timeout: 45_000 }, async () => {
+		await profileFile("corrupt", "{ bad");
+		await profileFile("default", "{ bad");
+		const output = await runLauncher(fixture, ["default", "--", "--version"]);
+		expect(output.code).toBe(0);
+		expect(output.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+	});
+
+	it.each(["{ bad", "[]", '{"skills":1}'])("rejects a selected illegal definition before Pi spawn: %s", { timeout: 30_000 }, async (content) => {
+		const file = await profileFile("review", content);
+		const output = await runLauncher(fixture, ["review", "--", "--version"]);
+		expect(output.code).toBe(2);
+		expect(output.stderr).toContain(file);
+		expect(output.stdout).toBe("");
+		expect(existsSync(path.join(fixture.profileSwitchDir, "instances"))).toBe(false);
+	});
+
+	it("does not fall back from a malformed saved existing profile", { timeout: 30_000 }, async () => {
+		const file = await profileFile("review", "{ bad");
+		await writeFile(path.join(fixture.agentDir, "pi-profile-state.json"), '{"activeProfile":"review"}');
+		const output = await runLauncher(fixture, ["--", "--version"]);
+		expect(output.code).toBe(2);
+		expect(output.stderr).toContain(file);
+		expect(output.stderr).not.toContain("starting the default profile");
+		expect(output.stdout).toBe("");
+	});
+
+	it("warns on unknown keys without forwarding them as native settings", { timeout: 45_000 }, async () => {
+		await profileFile("review", '{"skills":[],"defaultTools":["write"],"unknownNativeSetting":"ignored"}');
+		const output = await runLauncher(fixture, ["review", "--", "--version"]);
+		expect(output.code).toBe(0);
+		expect(output.stderr).toContain('unknown field "defaultTools" ignored');
+		expect(output.stderr).toContain('unknown field "unknownNativeSetting" ignored');
+		expect(output.stdout).not.toContain("unknown field");
+		const dirs = await readdir(path.join(fixture.profileSwitchDir, "instances"));
+		expect(dirs).toHaveLength(1);
+		const settings = JSON.parse(await readFile(path.join(fixture.profileSwitchDir, "instances", dirs[0]!, "settings.json"), "utf8"));
+		expect(Object.hasOwn(settings, "defaultTools")).toBe(false);
+		expect(Object.hasOwn(settings, "unknownNativeSetting")).toBe(false);
+	});
 });

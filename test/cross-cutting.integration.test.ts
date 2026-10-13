@@ -9,7 +9,7 @@
  *   the next reload;
  * - a shared skill's edit reaches EVERY referencing profile (observed via
  *   a second profile, not just the reloaded one);
- * - a profile without `mcps` activates fine with the adapter absent.
+ * - a profile without `mcps` activates fine without any MCP extension selected.
  */
 
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -123,7 +123,7 @@ describe("cross-cutting behaviors", () => {
 		);
 	}, 90_000);
 
-	it("a profile without mcp activates with the adapter absent", async () => {
+	it("a profile without mcp activates without any MCP extension selected", async () => {
 		await addGlobalSkill(fixture, "plain");
 		await writeCatalog({ plain: { skills: ["plain"] } });
 		// No adapter anywhere. Launch must succeed with only the profile's skill.

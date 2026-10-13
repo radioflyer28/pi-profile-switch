@@ -1,11 +1,11 @@
 /**
  * Integration: non-interactive modes and flag passthrough (ticket 11).
  *
- * Print and JSON modes launch the requested profile with complete
+ * Text and JSON modes launch the requested profile with complete
  * pre-start filtering (mode handling is entirely native Pi); both exit
  * cleanly offline with stdin closed. Unknown profiles fail with exit 2 in
  * every mode. Session flags pass through unchanged (unit-covered in
- * launcher-args/launcher-spawn; here end-to-end for print mode).
+ * launcher-args/launcher-spawn; here end-to-end for text mode).
  */
 
 import { mkdir, rm, writeFile } from "node:fs/promises";
@@ -48,9 +48,9 @@ describe("startup notifications in non-interactive modes", () => {
 		await writeFile(path.join(dir, "displayed.json"), JSON.stringify({ schemaVersion: 1, keys: [] }));
 	}
 
-	it("print mode writes the reminder to stderr only, leaving stdout native", async () => {
+	it("text mode writes the reminder to stderr only, leaving stdout native", async () => {
 		await seedLatestCache();
-		const result = await runLauncher(fixture, ["review", "--", "--mode", "print"]);
+		const result = await runLauncher(fixture, ["review", "--", "--mode", "text"]);
 		expect(result.code).toBe(0);
 		expect(result.stderr).toContain(ownVersion);
 		expect(result.stderr).toContain(newerTarget);
@@ -71,22 +71,22 @@ describe("startup notifications in non-interactive modes", () => {
 
 	it("shows the reminder only once across named and default profile launches", async () => {
 		await seedLatestCache();
-		const first = await runLauncher(fixture, ["review", "--", "--mode", "print"]);
+		const first = await runLauncher(fixture, ["review", "--", "--mode", "text"]);
 		expect(first.code).toBe(0);
 		expect(first.stderr).toContain(newerTarget);
 		// Second launch (default profile, same global workspace): the target
 		// was already shown — no second reminder, in any profile.
-		const second = await runLauncher(fixture, ["--", "--mode", "print"]);
+		const second = await runLauncher(fixture, ["--", "--mode", "text"]);
 		expect(second.code).toBe(0);
 		expect(second.stderr).not.toContain(newerTarget);
 	}, 60_000);
 });
 
 describe("non-interactive modes", () => {
-	it("print mode launches the profile and exits cleanly", async () => {
-		const result = await runLauncher(fixture, ["review", "--", "--mode", "print"]);
+	it("text mode launches the profile and exits cleanly", async () => {
+		const result = await runLauncher(fixture, ["review", "--", "--mode", "text"]);
 		expect(result.code).toBe(0);
-		expect(result.stderr).not.toMatch(/pi-profile:|Error/);
+		expect(result.stderr).not.toMatch(/^pi-profile:(?! notice:).*|Error/im);
 	}, 60_000);
 
 	it("json mode launches the profile and emits the session event", async () => {
@@ -96,15 +96,15 @@ describe("non-interactive modes", () => {
 		expect(JSON.parse(firstLine).type).toBe("session");
 	}, 60_000);
 
-	it("session flags pass through unchanged in print mode", async () => {
+	it("session flags pass through unchanged in text mode", async () => {
 		// --no-session must reach pi (a consumed flag would error the spawn or
-		// be swallowed); combined with --mode print the process still exits 0.
-		const result = await runLauncher(fixture, ["review", "--", "--mode", "print", "--no-session"]);
+		// be swallowed); combined with --mode text the process still exits 0.
+		const result = await runLauncher(fixture, ["review", "--", "--mode", "text", "--no-session"]);
 		expect(result.code).toBe(0);
 	}, 60_000);
 
-	it("unknown profiles fail with exit 2 in print mode too", async () => {
-		const result = await runLauncher(fixture, ["ghost", "--", "--mode", "print"]);
+	it("unknown profiles fail with exit 2 in text mode too", async () => {
+		const result = await runLauncher(fixture, ["ghost", "--", "--mode", "text"]);
 		expect(result.code).toBe(2);
 		expect(result.stderr).toMatch(/pi-profile:.*ghost/);
 	}, 60_000);

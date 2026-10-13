@@ -32,8 +32,8 @@ describe("launcher untrusted-project diagnostic", () => {
 			await mkdir(path.join(fixture.cwd, ".pi", "extensions"), { recursive: true });
 			await writeGlobalCatalog({ review: { skills: [] } });
 
-			const defaultLaunch = await runLauncher(fixture, ["--", "--mode", "print"]);
-			const namedLaunch = await runLauncher(fixture, ["review", "--", "--mode", "print"]);
+			const defaultLaunch = await runLauncher(fixture, ["--", "--mode", "text"]);
+			const namedLaunch = await runLauncher(fixture, ["review", "--", "--mode", "text"]);
 
 			for (const result of [defaultLaunch, namedLaunch]) {
 				expect(result.code).toBe(0);
@@ -56,7 +56,7 @@ describe("launcher untrusted-project diagnostic", () => {
 			await writeFile(path.join(fixture.cwd, ".pi", "settings.json"), "{}");
 			await writeFile(path.join(fixture.agentDir, "trust.json"), JSON.stringify({ [fixture.cwd]: true }));
 
-			const result = await runLauncher(fixture, ["--", "--mode", "print"]);
+			const result = await runLauncher(fixture, ["--", "--mode", "text"]);
 
 			expect(result.code).toBe(0);
 			expect(result.stderr).not.toContain("project is untrusted");
@@ -67,7 +67,7 @@ describe("launcher untrusted-project diagnostic", () => {
 		"does not report the diagnostic for an empty project forced untrusted with --no-approve",
 		{ timeout: 45_000 },
 		async () => {
-			const result = await runLauncher(fixture, ["--", "--mode", "print", "--no-approve"]);
+			const result = await runLauncher(fixture, ["--", "--mode", "text", "--no-approve"]);
 
 			expect(result.code).toBe(0);
 			expect(result.stderr).not.toContain("project is untrusted");

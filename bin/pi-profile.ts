@@ -19,11 +19,26 @@ import { UnknownProfileError, resolveInitialProfile } from "../src/launcher/init
 import { untrustedProjectDiagnostic } from "../src/launcher/untrusted-project-diagnostic.ts";
 import { sweepStaleInstances } from "../src/launcher/runtime-cleanup.ts";
 import { spawnPi } from "../src/launcher/spawn.ts";
-import { McpConfigError, MissingMcpAdapterError } from "../src/mcp-config.ts";
+import { McpConfigError } from "../src/mcp-config.ts";
 import { CatalogError } from "../src/profile-catalog.ts";
-import { ActivationError } from "../src/profile-resolver.ts";
+import { ActivationError, mergeResolutionDiagnostics, type ResolutionDiagnostic } from "../src/profile-resolver.ts";
+import { readLaunchPlanFile } from "../src/switching/apply-plan.ts";
 import { ensureStarterAssets } from "../src/starter-assets.ts";
 import { generateRuntimeDir } from "../src/settings-generator.ts";
+
+const emittedWarnings = new Set<string>();
+let emittedDiagnostics: ResolutionDiagnostic[] = [];
+function warn(message: string, diagnostic?: ResolutionDiagnostic): void {
+	if (diagnostic !== undefined) {
+		const merged = mergeResolutionDiagnostics(emittedDiagnostics, [diagnostic]);
+		if (merged.length === emittedDiagnostics.length) return;
+		emittedDiagnostics = merged;
+	} else {
+		if (emittedWarnings.has(message)) return;
+		emittedWarnings.add(message);
+	}
+	console.error(`pi-profile: warning: ${message}`);
+}
 
 try {
 	const args = parseLauncherArgs(process.argv.slice(2));
@@ -34,7 +49,7 @@ try {
 	// the launch (same pattern as the sweep below).
 	const starterAssets = await ensureStarterAssets({ agentDir });
 	for (const warning of starterAssets.warnings) {
-		console.error(`pi-profile: warning: ${warning}`);
+		warn(warning);
 	}
 	// Fails before spawning when the profile is unknown or cannot activate.
 	// --approve/--no-approve are consumed here as a one-run trust input.
@@ -44,14 +59,14 @@ try {
 		trustOverride: args.trustOverride,
 	});
 	for (const warning of warnings) {
-		console.error(`pi-profile: warning: ${warning}`);
+		warn(warning, plan.diagnostics?.find((issue) => issue.message === warning));
 	}
 	// Untrusted-project notice: fires identically for every profile (default
 	// included) because it is driven by the trust determination, not by which
 	// profile branch resolution took. Startup continues either way.
 	const untrustedNotice = untrustedProjectDiagnostic(process.cwd(), projectTrusted);
 	if (untrustedNotice) {
-		console.error(`pi-profile: warning: ${untrustedNotice}`);
+		warn(untrustedNotice);
 	}
 	// Stale per-launch instance dirs (dead pid, or no pid past the grace
 	// window) are swept before this launch materializes its own. Unrecognized
@@ -64,9 +79,13 @@ try {
 		console.error(`pi-profile: notice: ${notice}`);
 	}
 	for (const warning of sweep.warnings) {
-		console.error(`pi-profile: warning: ${warning}`);
+		warn(warning);
 	}
 	const generated = await generateRuntimeDir(plan, { agentDir, discovery, projectDir });
+	const materialized = await readLaunchPlanFile(generated.runtimeDir);
+	for (const warning of generated.warnings) {
+		warn(warning, materialized?.diagnostics?.find((issue) => issue.message === warning));
+	}
 	process.exitCode = await spawnPi({
 		generated,
 		piArgs: args.piArgs,
@@ -77,13 +96,13 @@ try {
 	});
 } catch (error) {
 	// Launcher input/selection failures (unknown profile, unresolvable
-	// references, missing adapter, malformed catalogs) are usage errors:
+	// references, malformed catalogs, illegal MCP config) are usage errors:
 	// exit 2. Unexpected failures: exit 1.
 	const isUsageError =
 		error instanceof UnknownProfileError ||
 		error instanceof ActivationError ||
 		error instanceof ExtensionError ||
-		error instanceof MissingMcpAdapterError ||
+
 		error instanceof McpConfigError ||
 		error instanceof CatalogError;
 	console.error(error instanceof Error ? `pi-profile: ${error.message}` : error);

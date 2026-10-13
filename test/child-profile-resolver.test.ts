@@ -135,4 +135,18 @@ describe("resolveNamedChildProfile", () => {
 		expect(second.resources.skills[0]?.contentDigest).not.toBe(first.resources.skills[0]?.contentDigest);
 		expect(second.digest).not.toBe(first.digest);
 	});
+	it("retains strict child resolution despite tolerant parent activation", async () => {
+		for (const [name, override] of [
+			["unknown-field", { typo: true }],
+			["native-mcp", { mcp_tools: {} }],
+			["native-roles", { subagents: { defaultModel: "provider/model" } }],
+		] as const) {
+			await writeProfile(name, child(override));
+			await expect(resolve(name)).rejects.toThrow(/unknown field|does not support/);
+		}
+		await writeProfile("modeled", child({ defaultProvider: "local", defaultModel: "review" }));
+		await expect(resolve("modeled")).rejects.toThrow(/no model validator/);
+		await expect(resolve("modeled", { validateModel: async () => "unavailable" })).rejects.toThrow(/unavailable/);
+		await expect(resolve("modeled", { validateModel: async () => undefined })).resolves.toMatchObject({ model: { provider: "local", id: "review" } });
+	});
 });

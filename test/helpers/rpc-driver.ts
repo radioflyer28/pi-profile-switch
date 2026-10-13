@@ -1,4 +1,7 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, type ChildProcess } from "node:child_process";
+import path from "node:path";
+import crossSpawn from "cross-spawn";
+const spawn = crossSpawn.spawn;
 import readline from "node:readline";
 
 /**
@@ -128,8 +131,29 @@ export class RpcDriver {
 	}
 
 	async close(): Promise<void> {
-		this.child.kill("SIGTERM");
-		await new Promise((resolve) => setTimeout(resolve, 300));
+		if (this.child.exitCode !== null || this.child.signalCode !== null) return;
+		// EOF requests native RPC shutdown and lets the launcher reconcile its
+		// deferred Windows state. Forced tree termination is only a fallback.
+		await new Promise<void>((resolve) => {
+			const finish = () => {
+				clearTimeout(timer);
+				this.child.off("exit", finish);
+				resolve();
+			};
+			const timer = setTimeout(finish, 3_000);
+			this.child.once("exit", finish);
+			this.child.stdin?.end();
+		});
+		if (this.child.exitCode !== null || this.child.signalCode !== null) return;
+		if (process.platform === "win32" && this.child.pid !== undefined) {
+			// Killing a launcher or npm shim alone leaves Pi/MCP descendants and
+			// their cwd handles alive, racing fixture removal with EBUSY.
+			const taskkill = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe");
+			await new Promise<void>((resolve) => execFile(taskkill, ["/pid", String(this.child.pid), "/t", "/f"], () => resolve()));
+		} else {
+			this.child.kill("SIGTERM");
+		}
+		await this.waitForExit();
 	}
 
 	/** Resolves once the spawned process has fully exited (in RPC launcher

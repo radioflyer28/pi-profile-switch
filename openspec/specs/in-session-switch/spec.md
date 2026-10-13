@@ -5,6 +5,78 @@ Defines the behavior of the `/profile` command family inside the Pi process: how
 
 ## Requirements
 
+### Requirement: Sparse resource selection across activation
+
+Switching and reload SHALL apply the resource-reference specification's "Sparse skill and extension selection" contract using the current real user settings. Switching to a profile that omits a previously selected kind SHALL remove the previous profile's restriction for that kind. Deleting a resource field from the current profile and reloading SHALL have the same effect, except for restrictions still declared by the current overlay.
+
+The existing session-preservation, rollback, and selection-persistence contracts SHALL apply to these transitions. Extension-directory representation SHALL transition under the same activation boundary as generated settings. A failed transition SHALL restore the prior instance extension path's absence or exact raw symlink target before reloading; real resource contents MUST remain unchanged.
+
+#### Scenario: Switching restores an omitted kind
+
+- **WHEN** a session switches from an explicit empty or nonempty skill/extension selection to a named profile omitting that kind
+- **THEN** that kind returns to current native visibility without a process restart, and session identity and history are retained
+
+#### Scenario: Reload after deleting a field restores native visibility
+
+- **WHEN** the current profile removes its skill or extension field and executes `/profile reload` without an overlay for that kind
+- **THEN** the previous field's restriction is removed and the other kind keeps its own current policy
+
+#### Scenario: Reload reflects real user edits
+
+- **WHEN** real user resource settings or package filters change while the active profile omits the affected kind, and the profile reloads
+- **THEN** the instance reflects the edited native input rather than retaining the previous instance's resource policy
+
+#### Scenario: Failed activation restores prior resource visibility
+
+- **WHEN** rewriting or reloading fails during a transition between declared and omitted resource selections
+- **THEN** the pre-transition runtime files and resource visibility are restored, and the target profile is not reported as active
+
+#### Scenario: Extension discovery representation follows both switch directions
+
+- **WHEN** a session switches between declared and omitted extension selections in either direction, or reloads after adding or deleting the extension field
+- **THEN** the instance extension representation follows the launcher layout contract, native patterns retain their meaning, and session identity and history remain unchanged
+
+#### Scenario: Failed mirror transition restores the prior representation
+
+- **WHEN** an extension-path transition or subsequent reload fails while switching between declared and omitted selections
+- **THEN** prior settings, plan, extension-path absence or raw link target, and loaded resources are restored without changing real extension files or persisting the failed selection
+
+#### Scenario: Failed activation reports its actionable cause across rollback reload
+
+- **WHEN** activation fails after managed writes or refuses unsafe instance extension-path content and rolls back through a reload
+- **THEN** the user receives a diagnostic identifying the failed activation and its cause, including the unsafe path and corrective action for a content refusal; invalidating the old command context does not discard the diagnostic, and reporting does not prevent restoration
+
+### Requirement: Native resource bases for overlays
+
+For a skill or extension kind omitted by the profile, overlay disables SHALL resolve against its native, referenceable discovery result and SHALL remove only matching user-level resources. Native resources outside the overlay's reference vocabulary MUST retain their native visibility. A kind declared by the profile SHALL continue to use its selected reference set as the overlay base.
+
+An overlay for one resource kind MUST NOT turn an undeclared different kind into an allowlist. These rules SHALL apply to named profiles and the `default` profile. Existing overlay grammar, failure tiering, startup lifetime, and project boundaries SHALL remain unchanged.
+
+#### Scenario: Overlay narrows an omitted kind
+
+- **WHEN** a profile omits a skill or extension field and the overlay disables a discovered user-level resource of that kind
+- **THEN** only the matching resource is disabled; the remaining native resources, package filters, and settings-only resources remain effective
+
+#### Scenario: Overlay disables a skill loaded through a native plain include
+
+- **WHEN** a profile omits skills, native settings directly include a referenceable user-level skill inside the real agent directory, and an overlay disables that skill
+- **THEN** the skill is no longer visible through either its direct include or runtime discovery path while unrelated skills retain native visibility
+
+#### Scenario: Overlay does not narrow an unrelated kind
+
+- **WHEN** a named or `default` profile has no skill/extension selections and an overlay disables only skills, only extensions, or only tools
+- **THEN** every unrelated resource kind retains native visibility and native extension controls
+
+#### Scenario: Removing a native-base overlay restores native visibility
+
+- **WHEN** a profile omits a resource kind and the overlay enables its stored disable entry or clears the overlay
+- **THEN** that kind returns to current native visibility rather than an empty selection or a wildcard allowlist
+
+#### Scenario: Native-base overlay glob is re-expanded
+
+- **WHEN** a stored disable glob belongs to an omitted resource kind and a newly discovered user-level resource matches it on reload
+- **THEN** the new match is disabled and nonmatching native resources remain visible
+
 ### Requirement: /profile command family
 
 `/profile` SHALL accept these subcommands: bare invocation (opens the selector), `use`, `reload`, `status`, and `overlay`.
@@ -30,43 +102,57 @@ All forms SHALL be available in every mode, including non-TUI modes; the bare se
 
 ### Requirement: In-session switching
 
-`/profile use <name>` SHALL execute in order: wait for the current agent turn to finish, snapshot the runtime files, re-resolve the target profile through the full launch path, rewrite the runtime files in place, and trigger Pi's native reload.
+`/profile use <name>` SHALL wait for Pi's native idle boundary without interrupting a turn, snapshot managed runtime files, re-resolve the target through the launch path, rewrite runtime files in place, and trigger Pi's native reload.
 
-Waiting SHALL use Pi's native idle wait and MUST NOT interrupt an in-flight turn.
+Re-resolution SHALL use the same trust, selected-definition validation, discovery, partial-reference diagnostics, MCP source handling, and native model handoff as launch. Non-fatal diagnostics SHALL NOT prevent switching or reload. A fatal selected-definition or execution failure SHALL retain the existing no-write or rollback guarantees.
 
-Re-resolution SHALL include the same validation as the launch path: trust determination, catalog read, resource discovery, model and MCP validation. When resolution fails, NO runtime file SHALL be written and the runtime stays in its pre-switch state.
+Switching MUST NOT restart Pi or change sessionId, message history, or the instance's project-trust input. The `trust.json` link form SHALL remain unchanged. Post-switch project visibility SHALL match direct launch of the target profile.
 
-Switching SHALL NOT restart the Pi process; the current session's sessionId and message history SHALL remain unchanged.
-
-Switching SHALL NOT change Pi's project-trust input: the instance's `trust.json` link form is identical before and after a switch, so project-level resource visibility stays stable within one process. Post-switch project-level visibility SHALL match launching directly with the target profile and MUST NOT require a process restart to take effect.
-
-`/profile use` SHALL persist the selection and SHALL discard the pre-switch profile's overlay.
-
-`/profile reload` SHALL follow the same path, but SHALL NOT produce a change summary and SHALL preserve the current profile's existing selection persistence (a one-shot selection made at launch remains one-shot after reload).
+`/profile use` SHALL persist the selection and discard the previous profile's overlay. `/profile reload` SHALL follow the same path, omit the change summary, and preserve the existing selection-persistence intent. Explicit empty MCP selection SHALL remain restrictive across use and reload; returning to omitted selection SHALL restore native snapshot availability.
 
 #### Scenario: Successful switch
-
-- **WHEN** `/profile use implement` is executed and both resolution and reload succeed
-- **THEN** the runtime files are rewritten with that profile's resolution result and the session is not interrupted
+- **WHEN** target resolution and native reload succeed
+- **THEN** the runtime uses the target's resolution result without interrupting or restarting the session
 
 #### Scenario: Project-level visibility unchanged by switching
-
-- **WHEN** the project is trusted, started with a named profile, and `/profile use default` is executed
-- **THEN** project-level skills and extensions are visible under both profiles, the process is not restarted, and sessionId and message history are unchanged
+- **WHEN** a trusted-project session switches between a named profile and `default`
+- **THEN** native project visibility, sessionId, and history are preserved
 
 #### Scenario: Failure at resolution stage
+- **WHEN** the target's winning definition contains a fatal JSON or supported-field shape error
+- **THEN** switching reports the cause and writes no runtime files
 
-- **WHEN** the target profile's references cannot resolve
-- **THEN** the operation fails reporting the cause, and no runtime file is modified
+#### Scenario: Missing references do not reject switching
+- **WHEN** the target contains usable references and missing references
+- **THEN** switching completes with warnings and keeps only its resolved user-level selection
+
+#### Scenario: Reload retries missing references
+- **WHEN** a previously missing selected resource becomes discoverable before `/profile reload`
+- **THEN** reload re-resolves the original declaration and makes that selected resource available
 
 #### Scenario: Reload preserves one-shot selection
+- **WHEN** a one-shot launch selection is followed by `/profile reload`
+- **THEN** reload does not newly persist that selection
 
-- **WHEN** launched as `pi-profile review` (one-shot selection), followed by `/profile reload`
-- **THEN** `review` is still running and the selection is not thereby written into runtime state
+#### Scenario: Switching to an empty MCP selection
+- **WHEN** a session switches from omitted MCP selection to explicit empty selection
+- **THEN** discovered user-level servers become unavailable without a process restart
+
+#### Scenario: Empty MCP selection survives reload
+- **WHEN** a profile with an explicit empty MCP selection reloads
+- **THEN** discovered user-level servers remain unavailable
+
+#### Scenario: Switching back to omitted MCP selection
+- **WHEN** a session switches from explicit MCP selection to omitted selection
+- **THEN** native merged-snapshot user-level availability returns
+
+#### Scenario: Extension model survives switch and reload
+- **WHEN** a target declares a model registered by an extension loaded during native reload
+- **THEN** no standalone pre-extension model check rejects the operation and Pi's native model lifecycle owns selection
 
 ### Requirement: Rollback on switch failure
 
-When reload fails, the runtime files from the snapshot SHALL be restored and reloaded again, then the failure cause reported. The runtime MUST NOT remain in a half-switched state.
+When rewriting runtime files or reloading fails, the runtime files from the snapshot SHALL be restored and the failure cause reported. If a reload was attempted or Pi might have observed rewritten files, the restored files SHALL be reloaded. The runtime MUST NOT remain in a half-switched state.
 
 Pi's interactive mode may swallow a reload rejection or failure without reporting it. A switch SHALL therefore verify after reload that it actually executed; when that cannot be proven, it SHALL be treated as a failure and rolled back.
 
@@ -84,13 +170,18 @@ Persistence of selection and overlay SHALL happen in the post-reload extension i
 - **WHEN** reload neither errors nor actually re-executes the extension
 - **THEN** it is treated as a failure and rolled back, reporting that reload did not execute
 
-### Requirement: Plan application and change summary at session start
+#### Scenario: Write fails after one managed file changes
 
-Every session start (launch, reload, new, resume, fork) SHALL apply the plan in the current runtime directory: expand the profile's original tool references against Pi's live tool registry at that moment, and set the expansion result as the active tool set.
+- **WHEN** switching a profile changes a managed runtime file and a later write fails before reload
+- **THEN** every managed runtime file is restored to its exact pre-switch state, selection and overlay remain unchanged, and the failed profile is not reported as active
 
-When the plan carries disabled tool entries from the overlay, the active tool set SHALL be the expansion of the base — the profile's tool references, or the live registry when the profile declares none — minus the tools matched by the disabled entries at that moment.
+### Requirement: Session-start plan application and change summary
 
-Tool literals with zero matches against the live registry SHALL be reported as warnings and MUST NOT be silently dropped.
+Every session start (launch, reload, new, resume, fork) SHALL apply the plan in the current runtime directory. When `tools` is declared, the active tool set SHALL combine its original references expanded against Pi's live non-MCP registry with the MCP-owned tools available under the server and per-server tool selections, plus the native entry points needed to reach enabled MCP tools. When `tools` is absent, Pi's current tool availability SHALL stay unchanged; overlay disabled tool entries still narrow their established base. An absent or empty `mcp_tools` object MUST NOT by itself change Pi's tool state.
+
+When the plan carries disabled tool entries from the overlay, the active tool set SHALL subtract their matches at that moment. The base for overlay resolution SHALL remain the profile's resolved Pi tool references when `tools` is declared, or the runtime's available tool set when it is not; per-server MCP tool filtering SHALL be governed by `mcp_tools` and server selection.
+
+Pi tool literals with zero matches against the applicable live registry SHALL be reported as warnings and MUST NOT be silently dropped. Literal selectors in `mcp_tools` SHALL remain restrictive without a missing-name diagnostic, as specified in "Per-server MCP tool selection" in the resource-reference specification.
 
 When the plan marks the selection for persistence and this session start was triggered by a reload, the active profile SHALL be written to the state file of that profile's source scope.
 
@@ -99,7 +190,17 @@ The change summary produced by a switch SHALL be injected into the next agent tu
 #### Scenario: Tools whitelist re-applied after reload
 
 - **WHEN** the new extension instance executes session start after reload
-- **THEN** the active tool set is reset to the original references expanded against the live registry
+- **THEN** the active non-MCP tool set is reset to the original references expanded against the live registry, while available MCP-owned tools and their native discovery entry points remain independent of those references
+
+#### Scenario: Built-in MCP extension does not own sibling extension tools
+
+- **WHEN** a profile declares `tools: []`, MCP servers provide tools through Pi's built-in MCP extension, and an unrelated extension registers a tool
+- **THEN** the unrelated extension's tool is not active after session start or reload, while MCP tools permitted by MCP policy and their native discovery entry points remain available
+
+#### Scenario: Codemode and deferred access after switch
+
+- **WHEN** the session switches to a profile with `tools: ["read"]` and an enabled server has tools reachable through Pi's codemode or deferred discovery entry points
+- **THEN** the model can use both kinds of MCP tool after reload without `tools` explicitly listing either entry point
 
 #### Scenario: Disabled tools stay disabled across reload
 
@@ -115,6 +216,16 @@ The change summary produced by a switch SHALL be injected into the next agent tu
 
 - **WHEN** the post-reload instance writes the active profile per the plan
 - **THEN** an overlay already in the state file remains unchanged, unless this switch explicitly requested discarding it
+
+#### Scenario: Profile switch changes per-server MCP tool policy
+
+- **WHEN** `/profile use review` switches from a profile allowing all `github` tools to one listing only `search`
+- **THEN** the existing Pi session retains its identity and history, and `github` tools other than `search` are no longer callable, including via indirect MCP calls
+
+#### Scenario: Empty MCP list survives reload
+
+- **WHEN** a profile with `mcp_tools: { "github": [] }` reloads
+- **THEN** the server remains enabled and no `github` tool becomes callable after the reload
 
 ### Requirement: Runtime overlay
 
@@ -211,22 +322,137 @@ A missing or corrupt state file SHALL be read as empty state and MUST NOT produc
 
 ### Requirement: Observability surface
 
-Bare `/profile` SHALL open the interactive selector over the visible profiles; outside TUI mode it SHALL degrade to printing the profile list, with the structured payload serving non-interactive consumers.
+Bare `/profile` SHALL open the interactive selector in TUI mode and otherwise print a profile list with a structured payload. The selector and degraded list SHALL preserve activation's project-trust gating and existing source ordering. Each entry SHALL identify its winning source and whether a project definition shadows a global one.
 
-The selector and the degraded list SHALL show only visible profiles and SHALL use the same trust gating as activation: profiles from an untrusted project MUST NOT appear.
+Invalid winning definitions SHALL be shown as unavailable with a file-bearing error while other entries remain usable. The selector MUST NOT activate an unavailable entry; explicit `/profile use` SHALL report that entry's validation error. Reserved-name and illegal-filename entries SHALL be diagnosed under the profile-catalog contract rather than replacing `default` or breaking the list.
 
-Each list entry SHALL report the winning definition's source and be marked when the project definition shadows a same-named global definition.
+`/profile status` SHALL report the active profile, overlay, resolved resource paths, MCP enabled/disabled/missing states, and actual registration winners for conflicts. Empty effective user-level MCP selection SHALL report discovered user servers as disabled while native trusted project servers retain their own state. Skipped-reference and source diagnostics SHALL be visible in displayed and structured status without claiming skipped resources are active or validating MCP tool selector names.
 
-`/profile status` SHALL report the active profile, the stored overlay, resolved resources and paths, the MCP server tri-state (enabled, discovered but not enabled, referenced but not discovered), and same-named tool or command conflicts with their actual winners.
-
-The degraded list and `status` SHALL be emitted as messages carrying structured payloads for non-interactive consumers.
+List and status messages SHALL retain structured payloads for non-interactive consumers.
 
 #### Scenario: Untrusted project's profiles are invisible
-
-- **WHEN** the project is untrusted and profiles exist in the project catalog
-- **THEN** neither the selector nor the list shows those profiles
+- **WHEN** an untrusted project contains profiles
+- **THEN** neither selector nor degraded list exposes those profiles
 
 #### Scenario: Same-named project definition shadows the global one
+- **WHEN** a trusted project overrides a global profile
+- **THEN** its list entry reports project source and the shadowing marker
 
-- **WHEN** the project and global catalogs define the same-named profile
-- **THEN** the list entry reports its source as project and is marked as shadowing the global definition
+#### Scenario: Empty MCP selection is visible in status
+- **WHEN** a profile has an explicit empty effective MCP selection and user servers are discovered
+- **THEN** status reports those user servers as disabled rather than enabled
+
+#### Scenario: Project-owned server remains enabled in status
+- **WHEN** an explicit empty user-level selection coexists with an enabled trusted-project server
+- **THEN** status preserves that server's native enabled state
+
+#### Scenario: Unavailable profile remains visible
+- **WHEN** a winning profile file is malformed
+- **THEN** listing shows it as unavailable with its file and error, while valid profiles remain selectable
+
+#### Scenario: Skipped resource is not reported as active
+- **WHEN** activation skipped a missing resource reference
+- **THEN** status contains its diagnostic and does not include it among resolved active resources
+
+#### Scenario: Missing policy server is not enabled in status
+- **WHEN** `mcp_tools` names a missing or disabled server
+- **THEN** status retains the declared-policy diagnostic without presenting that server as enabled or unrestricted
+
+#### Scenario: Catalog listing does not parse shadowed files
+- **WHEN** a valid trusted-project profile shadows a malformed global file
+- **THEN** listing shows the valid project winner and its shadowing marker without an error from parsing the global file
+
+### Requirement: MCP tool policy status and switch rollback
+
+`/profile status` SHALL show which enabled servers have unrestricted, explicitly restricted, or no MCP tools, including the declared selectors for explicitly restricted servers; it SHALL NOT report selector validity or missing-name candidates. When `mcps` is undeclared, a server the merged user-level configuration marks `enabled: false` SHALL appear as discovered but not enabled, rather than enabled. A switch or reload failure while applying a per-server restriction SHALL restore the previous MCP and Pi tool availability, not leave a partial policy.
+
+#### Scenario: Status distinguishes absent and empty lists
+
+- **WHEN** an active profile omits `github` from `mcp_tools` and explicitly sets `linear` to `[]`
+- **THEN** `/profile status` reports `github` as unrestricted and `linear` as having no enabled MCP tools
+
+#### Scenario: Status respects merged-config-disabled servers without an MCP whitelist
+
+- **WHEN** `mcps` is undeclared and the merged user-level configuration marks `linear` with `enabled: false` while `github` is enabled
+- **THEN** `/profile status` reports `github` as enabled and `linear` as discovered but not enabled, without listing `linear` as an unrestricted enabled server
+
+#### Scenario: Failed switch restores previous tool policy
+
+- **WHEN** a profile switch fails during reload after writing a different per-server tool policy
+- **THEN** the prior runtime files and tool availability are restored, and the cause is reported
+
+### Requirement: Subagent overrides follow profile activation and rollback
+
+Profile switching and reload SHALL apply subagent overrides through the same instance rewrite and native reload boundary as other profile settings. Rebuilding SHALL follow "Sparse native subagent settings materialization" in the launcher specification.
+
+Switching to a profile without effective subagent declarations SHALL remove previous-profile child overrides and restore the current real user's native subagent settings. Removing fields from the current profile and reloading SHALL remove only those profile contributions. Current real-settings edits SHALL be reflected on the next activation.
+
+A settings-write or reload failure SHALL restore the previous child settings and profile declaration exactly under the existing rollback contract. The system SHALL preserve Pi's session identity and history. It MUST NOT add child launches, live-task mutation, or task cancellation merely to enforce new defaults; Pi and pi-subagents SHALL retain their native reload and existing-run lifecycle.
+
+#### Scenario: Switching removes previous child overrides
+
+- **WHEN** the session switches from a profile with reviewer overrides to a profile with no effective subagent declaration
+- **THEN** instance child settings match the current real-user base, the previous declaration is absent from profile status, and session identity and history are retained
+
+#### Scenario: Reload removes a deleted role field
+
+- **WHEN** the active profile deletes a reviewer description override but keeps its model override and reloads
+- **THEN** the instance restores the native description input while retaining the profile model input
+
+#### Scenario: Activation picks up real-user edits
+
+- **WHEN** the real user's subagent settings change after launch and the profile reloads
+- **THEN** the new instance result uses the edited base rather than accumulating patches from the previous instance
+
+#### Scenario: Failed activation restores child settings and declarations
+
+- **WHEN** a write or reload fails after instance child settings have changed
+- **THEN** the previous settings and profile declaration are restored exactly, and no new selection or child policy is reported as active
+
+#### Scenario: Defaults do not create or manage child runs
+
+- **WHEN** a profile containing child defaults is activated or reloaded
+- **THEN** the profile integration issues no child launch, task-reconfiguration, or task-cancellation request of its own
+
+### Requirement: Declared subagent status and extension observations
+
+When the active profile has effective child declarations, `/profile status` SHALL include those declarations in its displayed and structured output, labeled as profile declarations rather than effective runtime mappings. The status SHALL direct users to pi-subagents' native model inspection for the live mapping. Runtime-owned agent fields that pi-subagents does not permit overriding MUST NOT be reported as successfully applied.
+
+Extension availability SHALL be observed from Pi's registered tool or command ownership rather than active-tool selection or the profile's selected-extension list alone. Registration names alone SHALL NOT prove ownership. A positively observed native extension SHALL be recognized even when loaded by CLI or project discovery, or when its delegation tool is registered but inactive.
+
+When effective declarations exist but the native extension cannot be confirmed, session-start/reload diagnostics SHALL be non-fatal and actionable. They SHALL identify the profile, explain that overrides might be inactive, and suggest checking native extension loading and live model inspection. An inconclusive observation SHALL NOT be presented as proof of unload or role validity. Without effective declarations, the system SHALL omit subagent-specific status and perform no subagent-specific observation or warning.
+
+#### Scenario: Status separates declaration from runtime mapping
+
+- **WHEN** the active profile declares a reviewer model and description
+- **THEN** status reports those as declared inputs and gives native model-inspection guidance without claiming that the final model, advertisement, or description has been applied
+
+#### Scenario: No declaration produces no new status or warning
+
+- **WHEN** the active profile omits effective child declarations
+- **THEN** status has no child-override section or structured child field, and startup/reload performs no child-specific registration observation or diagnostic
+
+#### Scenario: Missing native registration produces an actionable warning
+
+- **WHEN** effective declarations exist and no pi-subagents-owned registration can be confirmed
+- **THEN** startup or reload continues with a profile-named warning that explains the observation limit and how to check native loading and the live mapping
+
+#### Scenario: Lazy delegation is not treated as unload
+
+- **WHEN** pi-subagents owns a registered but inactive delegation tool or its lazy loader
+- **THEN** the extension is positively observed without activating any tool, and no missing-extension warning is emitted
+
+#### Scenario: CLI or project loading is recognized
+
+- **WHEN** pi-subagents is loaded through CLI or native project discovery instead of the profile's selected user-level extensions
+- **THEN** its owned registrations confirm the integration without changing extension selection or project trust
+
+#### Scenario: Same-named foreign registration does not prove loading
+
+- **WHEN** another extension wins a registration name normally used by pi-subagents and no other owned registration confirms pi-subagents
+- **THEN** the observation remains unconfirmed and does not claim that the foreign registration consumes the profile's child settings
+
+#### Scenario: Inconclusive ownership is non-fatal
+
+- **WHEN** registration ownership cannot be resolved because metadata or a package manifest is unavailable
+- **THEN** the observation is reported as unconfirmed rather than unloaded, activation remains successful, and no extension code is imported to resolve the uncertainty

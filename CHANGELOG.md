@@ -7,6 +7,69 @@
 * launch Pi through npm's Windows `.cmd` shim without shell command-string evaluation
 * let Pi supply its host package during direct Git installation
 
+## [0.16.0](https://github.com/VincentFF/pi-profile-switch/compare/v0.15.0...v0.16.0) (2026-10-09)
+
+
+### Features
+
+* add tolerant profile activation and simplify documentation ([#86](https://github.com/VincentFF/pi-profile-switch/issues/86)) ([dd948b5](https://github.com/VincentFF/pi-profile-switch/commit/dd948b5ded779c98f22747524085327c96071b4b))
+
+## [0.15.0](https://github.com/VincentFF/pi-profile-switch/compare/v0.14.0...v0.15.0) (2026-10-09)
+
+
+### Features
+
+* add native subagent overrides and sparse resource selection ([#84](https://github.com/VincentFF/pi-profile-switch/issues/84)) ([e4d06ef](https://github.com/VincentFF/pi-profile-switch/commit/e4d06efdd0a002207b39759f9c14180c6fc609bf))
+
+## [0.14.0](https://github.com/VincentFF/pi-profile-switch/compare/v0.13.2...v0.14.0) (2026-10-03)
+
+
+### Features
+
+* valid native MCP snapshots and gateway access ([#82](https://github.com/VincentFF/pi-profile-switch/issues/82)) ([7f2943f](https://github.com/VincentFF/pi-profile-switch/commit/7f2943f12ae87985a20f58af5564251f7bddcf87))
+
+## [0.13.2](https://github.com/VincentFF/pi-profile-switch/compare/v0.13.1...v0.13.2) (2026-10-01)
+
+
+### Bug Fixes
+
+* require native MCP Pi and refresh upgrade notice ([#80](https://github.com/VincentFF/pi-profile-switch/issues/80)) ([6a1f591](https://github.com/VincentFF/pi-profile-switch/commit/6a1f5910e52f72c4e61d8f54d69a37b42cb5cd3a))
+
+## [0.13.1](https://github.com/VincentFF/pi-profile-switch/compare/v0.13.0...v0.13.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* keep user skill exclusions under named profiles ([#76](https://github.com/VincentFF/pi-profile-switch/issues/76)) ([627d450](https://github.com/VincentFF/pi-profile-switch/commit/627d45004f60fc195ff7a87e9a249a3108bc5b85))
+
+## [0.13.0](https://github.com/VincentFF/pi-profile-switch/compare/v0.12.2...v0.13.0) (2026-10-01)
+
+
+### Features
+
+* adopt native Pi MCP, drop pi-mcp-adapter ([#73](https://github.com/VincentFF/pi-profile-switch/issues/73)) ([fa45418](https://github.com/VincentFF/pi-profile-switch/commit/fa4541818636f048425f2afaf6edfc13eafc8d42))
+
+## [0.12.2](https://github.com/VincentFF/pi-profile-switch/compare/v0.12.1...v0.12.2) (2026-09-30)
+
+
+### Bug Fixes
+
+* honor empty MCP allowlist ([#71](https://github.com/VincentFF/pi-profile-switch/issues/71)) ([b0853de](https://github.com/VincentFF/pi-profile-switch/commit/b0853de1b696335525f5619ce395c079724c4a97))
+
+## [0.12.1](https://github.com/VincentFF/pi-profile-switch/compare/v0.12.0...v0.12.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* drop startup notifier claim exclusion ([#69](https://github.com/VincentFF/pi-profile-switch/issues/69)) ([c70db8b](https://github.com/VincentFF/pi-profile-switch/commit/c70db8bf3aa31bc90d945a0acdfcb2d9febc6bfa))
+
+## [0.12.0](https://github.com/VincentFF/pi-profile-switch/compare/v0.11.0...v0.12.0) (2026-09-29)
+
+
+### Features
+
+* separate mcp tool ([#65](https://github.com/VincentFF/pi-profile-switch/issues/65)) ([cef4b9f](https://github.com/VincentFF/pi-profile-switch/commit/cef4b9f94656397085e1fab94b9d47d2ebf8b7bc))
+
 ## [0.11.0](https://github.com/VincentFF/pi-profile-switch/compare/v0.10.0...v0.11.0) (2026-09-28)
 
 

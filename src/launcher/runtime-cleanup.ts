@@ -136,7 +136,12 @@ async function scanContent(entryPath: string, instanceDir: string, budget: ScanB
 		budget.exceeded = true;
 		return;
 	}
-	if (content.includes(instanceDir)) budget.found = true;
+	// Windows paths in JSON are escaped; some extensions persist forward slashes.
+	// A serialized self-reference must be kept just like its literal form.
+	const portable = instanceDir.replaceAll("\\", "/");
+	if ([instanceDir, portable, JSON.stringify(instanceDir).slice(1, -1)].some((reference) => content.includes(reference))) {
+		budget.found = true;
+	}
 }
 
 /** Whether an unrecognized entry must be kept because its content scan says

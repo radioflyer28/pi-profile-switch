@@ -5,24 +5,24 @@
  *
  * Invariants:
  * - Each profile is stored in a separate `<name>.json` file.
- * - The built-in `default` profile never exists as a file and cannot be
- *   defined in any catalog (`default.json` is a hard error).
- * - Profile names must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`.
- * - A project profile with the same name fully replaces the global
- *   definition (no merge, no inheritance); removing the project file
- *   immediately reveals the global one.
- * - The caller passes `projectDir` only when the resolver's trust check
- *   passed — an untrusted project's catalog is never read.
- * - A malformed profile file fails loudly (CatalogError) with its file path
- *   rather than silently starting unfiltered.
+ * - Filename indexing decides project precedence before definition reads.
+ * - Only selected winners are parsed; listing isolates definition errors.
+ * - The caller supplies projectDir only after its trust check passes.
  */
 
-import type { Dirent } from "node:fs";
+import { readFileSync, type Dirent } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { getGlobalProfilesDir } from "./workspace.ts";
 import { isRecord, readJsonFile } from "./json-file.ts";
+import { parseSubagentSettings, SubagentSettingsError, type ProfileSubagentSettings } from "./subagent-settings.ts";
+
+const supportedFields = Object.keys(
+	(JSON.parse(readFileSync(new URL("../schemas/profiles.schema.json", import.meta.url), "utf8")) as {
+		properties: Record<string, unknown>;
+	}).properties,
+);
 
 export const DEFAULT_PROFILE_NAME = "default";
 export const PROFILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -53,12 +53,15 @@ export interface ProfileDefinition {
 	extensions?: string[];
 	mcps?: string[];
 	tools?: string[];
+	/** Literal MCP tool names per server; globs are rejected. */
+	mcp_tools?: Record<string, string[]>;
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: string;
 	instructions?: string;
 	/** Exact child-launch policy. Omitted profiles retain legacy session-only semantics. */
 	child?: ChildProfileDefinition;
+	subagents?: ProfileSubagentSettings;
 }
 
 /** Where a profile's definition came from. */
@@ -66,13 +69,24 @@ export type ProfileSource = "builtin" | "global" | "project";
 
 interface CatalogEntry {
 	source: "global" | "project";
-	definition: ProfileDefinition;
+	filePath: string;
 }
 
 export interface ResolvedProfile {
 	name: string;
 	source: ProfileSource;
 	definition: ProfileDefinition;
+	warnings?: string[];
+}
+
+export interface CatalogListItem {
+	name: string;
+	source: ProfileSource;
+	shadowsGlobal: boolean;
+	available: boolean;
+	definition?: ProfileDefinition;
+	error?: string;
+	warnings?: string[];
 }
 
 export class CatalogError extends Error {
@@ -146,12 +160,65 @@ function readChildDefinition(
 	};
 }
 
+function isGlobPattern(value: string): boolean {
+	return (
+		value.includes("*") ||
+		value.includes("?") ||
+		value.includes("[") ||
+		value.includes("]") ||
+		value.includes("{") ||
+		value.includes("}")
+	);
+}
+
+function readMcpTools(
+	value: unknown,
+	profileName: string,
+	filePath?: string,
+): Record<string, string[]> | undefined {
+	if (value === undefined) return undefined;
+	const prefix = filePath ? `${filePath}: ` : "";
+	if (!isRecord(value)) {
+		throw new CatalogError(`${prefix}profile "${profileName}": "mcp_tools" must be an object of string arrays`);
+	}
+	const entries: Array<[string, string[]]> = [];
+	for (const [server, tools] of Object.entries(value)) {
+		if (isGlobPattern(server)) {
+			throw new CatalogError(
+				`${prefix}profile "${profileName}": "mcp_tools" server "${server}" is a glob pattern; literal MCP server names are required`,
+			);
+		}
+		if (!Array.isArray(tools) || tools.some((entry) => typeof entry !== "string")) {
+			throw new CatalogError(`${prefix}profile "${profileName}": "mcp_tools" must be an object of string arrays`);
+		}
+		for (const tool of tools) {
+			if (isGlobPattern(tool)) {
+				throw new CatalogError(
+					`${prefix}profile "${profileName}": "mcp_tools" entry "${tool}" in server "${server}" is a glob pattern; literal MCP tool names are required`,
+				);
+			}
+		}
+		entries.push([server, [...tools]]);
+	}
+	return Object.fromEntries(entries);
+}
+
 /** Parses one raw profile definition; the single read-time validator so
  *  catalog files and any external writer stay loadable. */
-export function parseProfileDefinition(name: string, raw: unknown, filePath?: string): ProfileDefinition {
+export function parseProfileDefinition(
+	name: string,
+	raw: unknown,
+	filePath?: string,
+	onWarning?: (message: string) => void,
+): ProfileDefinition {
 	if (!isRecord(raw)) {
 		const prefix = filePath ? `${filePath}: ` : "";
 		throw new CatalogError(`${prefix}profile "${name}" must be an object`);
+	}
+	for (const key of Object.keys(raw)) {
+		if (!supportedFields.includes(key)) {
+			onWarning?.(`${filePath ? `${filePath}: ` : ""}profile "${name}": unknown field "${key}" ignored; supported fields: ${supportedFields.join(", ")}`);
+		}
 	}
 	const definition: ProfileDefinition = {};
 	const label = readOptionalString(raw.label, "label", name, filePath);
@@ -162,6 +229,8 @@ export function parseProfileDefinition(name: string, raw: unknown, filePath?: st
 		const entries = readStringArray(raw[field], field, name, filePath);
 		if (entries !== undefined) definition[field] = entries;
 	}
+	const mcpTools = readMcpTools(raw.mcp_tools, name, filePath);
+	if (mcpTools !== undefined) definition.mcp_tools = mcpTools;
 	const defaultProvider = readOptionalString(raw.defaultProvider, "defaultProvider", name, filePath);
 	if (defaultProvider !== undefined) definition.defaultProvider = defaultProvider;
 	const defaultModel = readOptionalString(raw.defaultModel, "defaultModel", name, filePath);
@@ -172,11 +241,18 @@ export function parseProfileDefinition(name: string, raw: unknown, filePath?: st
 	if (instructions !== undefined) definition.instructions = instructions;
 	const child = readChildDefinition(raw.child, name, filePath);
 	if (child !== undefined) definition.child = child;
+	try {
+		const subagents = parseSubagentSettings(raw.subagents, { profile: name, ...(filePath !== undefined ? { filePath } : {}) });
+		if (subagents !== undefined) definition.subagents = subagents;
+	} catch (error) {
+		if (error instanceof SubagentSettingsError) throw new CatalogError(error.message);
+		throw error;
+	}
 	return definition;
 }
 
-/** Reads one catalog directory; missing directory → empty map, malformed file → CatalogError. */
-export async function loadCatalogDirectory(dirPath: string): Promise<Map<string, ProfileDefinition>> {
+/** Indexes regular JSON files without reading their definitions. */
+async function indexCatalogDirectory(dirPath: string, diagnostics: string[]): Promise<Map<string, string>> {
 	let entries: Dirent[];
 	try {
 		entries = await readdir(dirPath, { withFileTypes: true });
@@ -191,7 +267,7 @@ export async function loadCatalogDirectory(dirPath: string): Promise<Map<string,
 	const jsonEntries = entries.filter((entry) => entry.name.endsWith(".json"));
 	jsonEntries.sort((a, b) => a.name.localeCompare(b.name));
 
-	const profiles = new Map<string, ProfileDefinition>();
+	const profiles = new Map<string, string>();
 	for (const entry of jsonEntries) {
 		const fullPath = path.join(dirPath, entry.name);
 		let isFile = entry.isFile();
@@ -207,42 +283,32 @@ export async function loadCatalogDirectory(dirPath: string): Promise<Map<string,
 
 		const profileName = entry.name.slice(0, -".json".length);
 		if (profileName === DEFAULT_PROFILE_NAME) {
-			throw new CatalogError(
-				`${fullPath}: "${DEFAULT_PROFILE_NAME}" is built in and must not be defined in the catalog`,
-			);
+			diagnostics.push(`${fullPath}: "${DEFAULT_PROFILE_NAME}" is built in and must not be defined in the catalog`);
+			continue;
 		}
 		if (!PROFILE_NAME_PATTERN.test(profileName)) {
-			throw new CatalogError(
-				`${fullPath}: invalid profile name "${profileName}" (must match ${PROFILE_NAME_PATTERN})`,
-			);
+			diagnostics.push(`${fullPath}: invalid profile name "${profileName}" (must match ${PROFILE_NAME_PATTERN})`);
+			continue;
 		}
 
-		const result = await readJsonFile(fullPath);
-		if (!result.ok) {
-			throw new CatalogError(`invalid JSON in ${fullPath}`);
-		}
-		const parsed = result.value;
-		if (!isRecord(parsed)) {
-			throw new CatalogError(`${fullPath}: profile definition must be an object`);
-		}
-		profiles.set(profileName, parseProfileDefinition(profileName, parsed, fullPath));
+		profiles.set(profileName, fullPath);
 	}
 	return profiles;
 }
 
 export class ProfileCatalog {
 	readonly #profiles: ReadonlyMap<string, CatalogEntry>;
+	readonly #globalNames: ReadonlySet<string>;
+	readonly #diagnostics: readonly string[];
 
-	private constructor(profiles: ReadonlyMap<string, CatalogEntry>) {
+	private constructor(profiles: ReadonlyMap<string, CatalogEntry>, globalNames: ReadonlySet<string>, diagnostics: string[]) {
 		this.#profiles = profiles;
+		this.#globalNames = globalNames;
+		this.#diagnostics = diagnostics;
 	}
 
-	/**
-	 * Reads the global catalog, plus the project catalog when `projectDir` is
-	 * given (trusted projects only — the caller gates on the trust check).
-	 * Missing directories mean an empty catalog; malformed content throws
-	 * CatalogError. Project entries replace same-name global entries.
-	 */
+	/** Indexes global and trusted-project filenames. Project winners keep the
+	 *  global position; project-only names follow in alphabetical order. */
 	static async load(_agentDir: string, options?: { projectDir?: string }): Promise<ProfileCatalog> {
 		return ProfileCatalog.loadFromDirectories(
 			getGlobalProfilesDir(),
@@ -252,36 +318,63 @@ export class ProfileCatalog {
 
 	/** Explicit-directory variant for side-effect-free SDK consumers and tests. */
 	static async loadFromDirectories(globalProfilesDir: string, projectProfilesDir?: string): Promise<ProfileCatalog> {
-		const globalProfiles = await loadCatalogDirectory(globalProfilesDir);
+		const diagnostics: string[] = [];
+		const globalProfiles = await indexCatalogDirectory(globalProfilesDir, diagnostics);
 		const profiles = new Map<string, CatalogEntry>();
-		for (const [name, definition] of globalProfiles) {
-			profiles.set(name, { source: "global", definition });
+		for (const [name, filePath] of globalProfiles) {
+			profiles.set(name, { source: "global", filePath });
 		}
 		if (projectProfilesDir !== undefined) {
-			const projectProfiles = await loadCatalogDirectory(projectProfilesDir);
-			for (const [name, definition] of projectProfiles) {
-				profiles.set(name, { source: "project", definition });
+			const projectProfiles = await indexCatalogDirectory(projectProfilesDir, diagnostics);
+			for (const [name, filePath] of projectProfiles) {
+				profiles.set(name, { source: "project", filePath });
 			}
 		}
-		return new ProfileCatalog(profiles);
+		return new ProfileCatalog(profiles, new Set(globalProfiles.keys()), diagnostics);
 	}
 
-	/** Resolves a profile by name. `default` always resolves to the built-in
-	 *  full-resource profile; unknown names return undefined. */
-	resolve(name: string): ResolvedProfile | undefined {
+	hasGlobal(name: string): boolean {
+		return this.#globalNames.has(name);
+	}
+
+	diagnostics(): string[] {
+		return [...this.#diagnostics];
+	}
+
+	/** Reads only the winning definition, freshly on every resolution. */
+	async resolve(name: string): Promise<ResolvedProfile | undefined> {
+		if (!PROFILE_NAME_PATTERN.test(name)) {
+			throw new CatalogError(`invalid profile name "${name}" (must match ${PROFILE_NAME_PATTERN})`);
+		}
 		if (name === DEFAULT_PROFILE_NAME) {
 			return { name: DEFAULT_PROFILE_NAME, source: "builtin", definition: {} };
 		}
 		const entry = this.#profiles.get(name);
-		return entry === undefined ? undefined : { name, source: entry.source, definition: entry.definition };
+		if (entry === undefined) return undefined;
+		const result = await readJsonFile(entry.filePath);
+		if (!result.ok) {
+			throw new CatalogError(result.reason === "missing"
+				? `${entry.filePath}: profile "${name}" disappeared; retry resolution`
+				: `invalid JSON in ${entry.filePath}`);
+		}
+		const warnings: string[] = [];
+		const definition = parseProfileDefinition(name, result.value, entry.filePath, (warning) => warnings.push(warning));
+		return { name, source: entry.source, definition, ...(warnings.length > 0 ? { warnings } : {}) };
 	}
 
-	/** Lists the built-in default first, then profiles in file order (global
-	 *  entries in global alphabetical order, project-only names appended after in alphabetical order). */
-	list(): ResolvedProfile[] {
-		return [
-			this.resolve(DEFAULT_PROFILE_NAME)!,
-			...[...this.#profiles.keys()].map((name) => this.resolve(name)!),
-		];
+	/** Lists only winners, retaining expected definition errors per entry. */
+	async list(): Promise<CatalogListItem[]> {
+		const items: CatalogListItem[] = [{ name: DEFAULT_PROFILE_NAME, source: "builtin", definition: {}, available: true, shadowsGlobal: false }];
+		for (const [name, entry] of this.#profiles) {
+			const metadata = { name, source: entry.source, shadowsGlobal: entry.source === "project" && this.hasGlobal(name) };
+			try {
+				const profile = (await this.resolve(name))!;
+				items.push({ ...profile, ...metadata, available: true });
+			} catch (error) {
+				if (!(error instanceof CatalogError)) throw error;
+				items.push({ ...metadata, available: false, error: error.message });
+			}
+		}
+		return items;
 	}
 }

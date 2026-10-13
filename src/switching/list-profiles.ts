@@ -20,23 +20,30 @@ export interface ProfileListEntry {
 	/** True when a global definition of the same name is shadowed by the
 	 *  project one. */
 	shadowsGlobal: boolean;
+	available: boolean;
+	error?: string;
+	warnings?: string[];
 }
 
 export async function listProfiles(input: {
 	realAgentDir: string;
 	cwd: string;
+	onDiagnostic?: (message: string) => void;
 }): Promise<ProfileListEntry[]> {
 	const { projectTrusted } = await readTrustInputs({ agentDir: input.realAgentDir, cwd: input.cwd });
 	const catalog = await ProfileCatalog.load(input.realAgentDir, {
 		projectDir: projectTrusted ? input.cwd : undefined,
 	});
-	const globalOnly = projectTrusted ? await ProfileCatalog.load(input.realAgentDir) : catalog;
-	return catalog.list().map((profile) => ({
+	for (const diagnostic of catalog.diagnostics()) input.onDiagnostic?.(diagnostic);
+	return (await catalog.list()).map((profile) => ({
 		name: profile.name,
 		source: profile.source,
-		...(typeof profile.definition.label === "string" ? { label: profile.definition.label } : {}),
-		...(typeof profile.definition.description === "string" ? { description: profile.definition.description } : {}),
-		shadowsGlobal: profile.source === "project" && globalOnly.resolve(profile.name) !== undefined,
+		...(typeof profile.definition?.label === "string" ? { label: profile.definition.label } : {}),
+		...(typeof profile.definition?.description === "string" ? { description: profile.definition.description } : {}),
+		shadowsGlobal: profile.shadowsGlobal,
+		available: profile.available,
+		...(profile.error !== undefined ? { error: profile.error } : {}),
+		...(profile.warnings !== undefined ? { warnings: profile.warnings } : {}),
 	}));
 }
 
@@ -49,7 +56,8 @@ export function formatProfileList(entries: ProfileListEntry[], activeProfile?: s
 			const active = entry.name === activeProfile ? " ← active" : "";
 			const shadowed = entry.shadowsGlobal ? " (shadows global)" : "";
 			const label = entry.label ?? entry.description;
-			return `${entry.name} [${entry.source}]${shadowed}${label !== undefined ? ` — ${label}` : ""}${active}`;
+			const unavailable = !entry.available ? ` — unavailable: ${entry.error ?? "retry reading the profile definition"}` : "";
+			return [`${entry.name} [${entry.source}]${shadowed}${label !== undefined ? ` — ${label}` : ""}${unavailable}${active}`, ...(entry.warnings ?? []).map((warning) => `  warning: ${warning}`)].join("\n");
 		})
 		.join("\n");
 }

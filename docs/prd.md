@@ -8,7 +8,7 @@ Pi discovers resources globally: whichever skills, extensions, MCP servers, and 
 - Dangerous capabilities stay resident. File writes, command execution, and write access to external systems remain in the tool list once installed.
 - Boundaries can only exist in prompts. Switching between "read-only review" and "full implementation" means switching the capability set itself — a prompt cannot constrain whether a tool exists.
 
-Profiles turn resource selection into an explicit, switchable object, optionally accompanied by a declared model, thinking level, and extra system-prompt instructions. A profile does not copy resources: a `SKILL.md`, extension, or MCP server has exactly one implementation, referenced by any number of profiles.
+Profiles turn resource selection into an explicit, switchable object, optionally accompanied by a declared model, thinking level, extra system-prompt instructions, and native child-role settings. Child-role declarations are an opt-in profile behavior, described by the [profile-catalog contract](../openspec/specs/profile-catalog/spec.md). A profile does not copy resources: a `SKILL.md`, extension, or MCP server has exactly one implementation, referenced by any number of profiles.
 
 ```text
 SkillRegistry
@@ -63,17 +63,17 @@ Rationale: Pi itself is minimal, and the profile layer should not become a new l
 - **No resource copies.** A profile references skills, extensions, MCP servers, and tools by name and never stores copies. Copying would fork implementations into N variants and violates the premise that users directly own their resources.
 - **No extension dependency graph.** No dependency declarations, no dependency closure, no always-on extension concept. Pi itself has none of these; introducing them at the profile layer would turn the switcher into half a package manager.
 - **Not a package manager.** Does not install, upgrade, or uninstall extensions; only discovers what is already installed and filters from it. Startup upgrade reminders and announcements likewise never install or upgrade anything: they only name the global-install command for the user to run.
-- **No MCP connection parameters or credentials.** Server addresses, start commands, OAuth, and tokens all stay in `pi-mcp-adapter`'s configuration; a profile only declares which servers are enabled.
+- **No MCP connection parameters or credentials.** Server addresses, start commands, OAuth, and tokens all stay in Pi's user-level MCP configuration (`~/.config/mcp/mcp.json`, `~/.agents/mcp.json`, `~/.agents/mcp/mcp.json`, and `<agentDir>/mcp.json`); a profile only declares which servers are enabled and, optionally via `mcp_tools`, which MCP tool selections apply per server. Pi tool selection (`tools`) and per-server MCP tool selection (`mcp_tools`) are independent; omitting `mcp_tools` preserves full native tool availability for enabled servers.
 - **No narrowing of project-level resources.** A profile's selection applies only to user-level resources (the real agentDir and `~/.agents/skills`). The visibility of project-level skills, extensions, prompts, themes, settings, and MCP servers is decided by Pi's project-trust determination; no profile may hide any of them. Rationale: Pi's project-level switch is all-or-nothing, and the scope in which "selected means effective" must stay within what a profile is entitled to dispose of; forced narrowing would additionally block project content that is not part of the isolation surface and would break in-session switching (see the filtering model in [Architecture](architecture/overview.md)).
 - **No changes to Pi defaults.** Settings, discovery, and session behavior that no profile has declared control over work according to Pi's native rules.
 
 ## Success criteria
 
-1. When launched with a given profile, the first agent turn sees only the user-level resources selected by that profile, plus the project-level resources admitted by the trust determination; all other user-level resources are invisible.
+1. A launched profile's user-level resource visibility follows the [sparse skill and extension selection contract](../openspec/specs/resource-reference/spec.md): a declared kind is a selection, an omitted kind keeps Pi's native visibility. Project-level visibility follows the trust determination, per the [project boundary](../openspec/specs/resource-reference/spec.md#requirement-narrowing-boundary-of-project-level-resources).
 2. Switching profiles does not restart the Pi process; the current session's sessionId and history remain unchanged.
 3. After modifying a skill or extension referenced by multiple profiles, those profiles pick up the new content on the next launch or reload without touching any profile definition.
 4. When a profile declares no model, thinking level, or instructions, Pi's model, thinking level, and system prompt after activation match a native launch.
-5. Without `pi-mcp-adapter` installed, every profile that declares no MCP servers remains fully functional.
+5. Without any MCP server configuration, every profile that declares no MCP servers and no MCP tool restrictions remains fully functional.
 6. A failed profile activation leaves no half-activated state behind and reports an actionable cause.
 
 ## Related documents

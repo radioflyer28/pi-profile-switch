@@ -4,7 +4,7 @@
  * Two independent sources, checked once per Pi process launch and presented
  * through a caller-supplied NoticeSurface:
  *
- * - npm package metadata: compare the running package version against the
+ * - npm dist-tags: compare the running package version against the
  *   registry's installable `latest` dist-tag and remind once per target
  *   version (design decision 2: authority and cache).
  * - a single maintainer-reviewed `announcements.json` feed (design decision
@@ -21,8 +21,7 @@
  * (`workspaceDir`, i.e. `getProfileSwitchDir()`).
  */
 
-import { createHash } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { isRecord } from "./json-file.ts";
@@ -31,9 +30,9 @@ import { isRecord } from "./json-file.ts";
 export const ANNOUNCEMENTS_URL =
 	"https://raw.githubusercontent.com/VincentFF/pi-profile-switch/main/announcements.json";
 
-/** npm registry package metadata; the installable stable version is read
- *  from `dist-tags.latest`, never from the largest published version. */
-const NPM_METADATA_URL = "https://registry.npmjs.org/pi-profile-switch";
+/** npm registry dist-tags; the installable stable version is read from
+ *  top-level `latest`, never from the largest published version. */
+const NPM_DIST_TAGS_URL = "https://registry.npmjs.org/-/package/pi-profile-switch/dist-tags";
 
 /** Hard ceiling on one remote check; the timer is unref'd so a pending
  *  check never keeps a short-lived Pi process alive. */
@@ -61,9 +60,6 @@ const MAX_ANNOUNCEMENTS = 50;
 const MAX_ID_LENGTH = 128;
 const MAX_MESSAGE_LENGTH = 400;
 const MAX_ACTION_LENGTH = 200;
-/** A pending display claim older than this is considered abandoned (the
- *  presenting process died mid-display) and may be reclaimed. */
-const CLAIM_STALE_MS = 10 * 60 * 1000;
 const HISTORY_SCHEMA_VERSION = 1;
 
 export interface NoticeSurface {
@@ -265,10 +261,10 @@ function parseNpmLatest(text: string): string {
 	} catch {
 		throw new InvalidContentError("response is not valid JSON");
 	}
-	if (!isRecord(raw) || !isRecord(raw["dist-tags"]) || typeof raw["dist-tags"].latest !== "string") {
-		throw new InvalidContentError("missing dist-tags.latest");
+	if (!isRecord(raw) || typeof raw.latest !== "string") {
+		throw new InvalidContentError("missing latest");
 	}
-	const latest = raw["dist-tags"].latest;
+	const latest = raw.latest;
 	if (parseVersion(latest) === undefined) {
 		throw new InvalidContentError(`malformed latest version: ${JSON.stringify(latest)}`);
 	}
@@ -276,7 +272,7 @@ function parseNpmLatest(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Global history and exclusive display claims
+// Global history
 // ---------------------------------------------------------------------------
 
 function notificationsDir(workspaceDir: string): string {
@@ -314,41 +310,6 @@ async function recordDisplayed(dir: string, key: string): Promise<void> {
 	const keys = await readDisplayedKeys(dir);
 	keys.add(key);
 	await atomicWriteJson(path.join(dir, "displayed.json"), { schemaVersion: HISTORY_SCHEMA_VERSION, keys: [...keys] });
-}
-
-function claimFile(dir: string, key: string): string {
-	const digest = createHash("sha256").update(key).digest("hex");
-	return path.join(dir, "claims", `${digest}.json`);
-}
-
-/** Exclusive per-key claim around synchronous presentation: concurrent
- *  launches (same process or separate ones) cannot both display the same
- *  notice. Abandoned claims go stale and become reclaimable. */
-async function tryAcquireClaim(dir: string, key: string, nowMs: number): Promise<boolean> {
-	const file = claimFile(dir, key);
-	await mkdir(path.dirname(file), { recursive: true });
-	for (let attempt = 0; attempt < 2; attempt++) {
-		try {
-			const handle = await open(file, "wx");
-			try {
-				await handle.writeFile(JSON.stringify({ key, at: nowMs }));
-			} finally {
-				await handle.close();
-			}
-			return true;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			const existing = await readJsonQuiet(file);
-			const at = isRecord(existing) && typeof existing.at === "number" ? existing.at : 0;
-			if (nowMs - at <= CLAIM_STALE_MS) return false;
-			await rm(file, { force: true });
-		}
-	}
-	return false;
-}
-
-async function releaseClaim(dir: string, key: string): Promise<void> {
-	await rm(claimFile(dir, key), { force: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -425,16 +386,8 @@ function report(surface: NoticeSurface, message: string): void {
 }
 
 async function present(dir: string, candidate: Candidate, surface: NoticeSurface, nowMs: number): Promise<void> {
-	if (!(await tryAcquireClaim(dir, candidate.key, nowMs))) return;
-	try {
-		surface.display(candidate.message, candidate.level);
-		await recordDisplayed(dir, candidate.key);
-	} catch (error) {
-		// A failed presentation releases its claim so a later launch retries.
-		await releaseClaim(dir, candidate.key);
-		throw error;
-	}
-	await releaseClaim(dir, candidate.key);
+	surface.display(candidate.message, candidate.level);
+	await recordDisplayed(dir, candidate.key);
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +574,7 @@ async function run(options: StartupNotifierOptions): Promise<void> {
 		const refreshedNpm = await refreshSource<{ latest: string }>({
 			dir,
 			name: "npm-latest",
-			url: NPM_METADATA_URL,
+			url: NPM_DIST_TAGS_URL,
 			label: "npm registry",
 			cache: npmCache,
 			parse: (text) => ({ latest: parseNpmLatest(text) }),

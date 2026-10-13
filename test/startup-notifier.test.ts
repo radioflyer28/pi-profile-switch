@@ -21,7 +21,7 @@ import {
 	type NoticeSurface,
 } from "../src/startup-notifier.ts";
 
-const NPM_METADATA_URL = "https://registry.npmjs.org/pi-profile-switch";
+const NPM_DIST_TAGS_URL = "https://registry.npmjs.org/-/package/pi-profile-switch/dist-tags";
 
 interface RecordedMessage {
 	message: string;
@@ -66,7 +66,7 @@ function fakeFetch(routes: Record<string, string | Error | "hang">): {
 }
 
 function npmBody(latest: string): string {
-	return JSON.stringify({ name: "pi-profile-switch", "dist-tags": { latest } });
+	return JSON.stringify({ latest });
 }
 
 interface AnnouncementSpec {
@@ -134,7 +134,7 @@ async function run(options: {
 
 describe("startup notifier: version reminder", () => {
 	it("shows a reminder naming both versions and the global-install command when latest is newer", async () => {
-		const { surface } = await run({ routes: { [NPM_METADATA_URL]: npmBody("1.1.0") }, installed: "1.0.0" });
+		const { surface } = await run({ routes: { [NPM_DIST_TAGS_URL]: npmBody("1.1.0") }, installed: "1.0.0" });
 		expect(surface.messages).toHaveLength(1);
 		const notice = surface.messages[0]!;
 		expect(notice.level).toBe("info");
@@ -145,19 +145,33 @@ describe("startup notifier: version reminder", () => {
 		expect(notice.message).not.toMatch(/changelog|release notes|github\.com/i);
 	});
 
+	it("uses the compact dist-tags URL when full metadata exceeds the response limit", async () => {
+		const oversizedMetadata = JSON.stringify({ "dist-tags": { latest: "1.1.0" }, versions: "x".repeat(64 * 1024) });
+		const { surface, requested } = await run({
+			routes: {
+				[NPM_DIST_TAGS_URL]: npmBody("1.1.0"),
+				"https://registry.npmjs.org/pi-profile-switch": oversizedMetadata,
+			},
+		});
+		expect(requested).toEqual([ANNOUNCEMENTS_URL, NPM_DIST_TAGS_URL]);
+		expect(surface.messages.filter((entry) => entry.level === "info").map((entry) => entry.message)).toEqual([
+			"pi-profile-switch 1.0.0 → 1.1.0: upgrade with npm install -g pi-profile-switch",
+		]);
+	});
+
 	it("compares version segments numerically, not lexically", async () => {
-		const { surface } = await run({ routes: { [NPM_METADATA_URL]: npmBody("1.10.0") }, installed: "1.9.0" });
+		const { surface } = await run({ routes: { [NPM_DIST_TAGS_URL]: npmBody("1.10.0") }, installed: "1.9.0" });
 		expect(surface.messages).toHaveLength(1);
 		expect(surface.messages[0]!.message).toContain("1.10.0");
 	});
 
 	it("shows no reminder when the running version equals latest", async () => {
-		const { surface } = await run({ routes: { [NPM_METADATA_URL]: npmBody("1.0.0") }, installed: "1.0.0" });
+		const { surface } = await run({ routes: { [NPM_DIST_TAGS_URL]: npmBody("1.0.0") }, installed: "1.0.0" });
 		expect(surface.messages).toEqual([]);
 	});
 
 	it("shows no reminder when the running version is ahead of latest", async () => {
-		const { surface } = await run({ routes: { [NPM_METADATA_URL]: npmBody("0.9.9") }, installed: "1.0.0" });
+		const { surface } = await run({ routes: { [NPM_DIST_TAGS_URL]: npmBody("0.9.9") }, installed: "1.0.0" });
 		expect(surface.messages).toEqual([]);
 	});
 
@@ -165,7 +179,7 @@ describe("startup notifier: version reminder", () => {
 		// 2.0.0-alpha is ahead of 1.9.0 per SemVer ordering; npm's installable
 		// latest stays behind, so no reminder (spec: "No newer installable version").
 		const { surface } = await run({
-			routes: { [NPM_METADATA_URL]: npmBody("1.9.0") },
+			routes: { [NPM_DIST_TAGS_URL]: npmBody("1.9.0") },
 			installed: "2.0.0-alpha",
 		});
 		expect(surface.messages).toEqual([]);
@@ -173,7 +187,7 @@ describe("startup notifier: version reminder", () => {
 
 	it("reminds when a prerelease install is behind the stable latest tag", async () => {
 		const { surface } = await run({
-			routes: { [NPM_METADATA_URL]: npmBody("1.0.0") },
+			routes: { [NPM_DIST_TAGS_URL]: npmBody("1.0.0") },
 			installed: "1.0.0-beta.2",
 		});
 		expect(surface.messages).toHaveLength(1);
@@ -184,14 +198,14 @@ describe("startup notifier: version reminder", () => {
 	it("orders prerelease identifiers numerically and alphabetically", async () => {
 		// 1.0.0-beta.10 > 1.0.0-beta.2 (numeric identifiers), and both < 1.0.0.
 		const { surface } = await run({
-			routes: { [NPM_METADATA_URL]: npmBody("1.0.0-beta.10") },
+			routes: { [NPM_DIST_TAGS_URL]: npmBody("1.0.0-beta.10") },
 			installed: "1.0.0-beta.2",
 		});
 		expect(surface.messages).toHaveLength(1);
 	});
 
 	it("silently skips malformed latest versions instead of comparing lexically", async () => {
-		const { surface } = await run({ routes: { [NPM_METADATA_URL]: npmBody("not-a-version") }, installed: "1.0.0" });
+		const { surface } = await run({ routes: { [NPM_DIST_TAGS_URL]: npmBody("not-a-version") }, installed: "1.0.0" });
 		expect(surface.messages.filter((entry) => entry.level === "info")).toEqual([]);
 	});
 });
@@ -263,7 +277,7 @@ describe("startup notifier: announcements", () => {
 	});
 });
 
-describe("startup notifier: per-source cache, backoff, and claims", () => {
+describe("startup notifier: per-source cache and backoff", () => {
 	async function seedNpmCache(latest: string, timestamps?: { lastSuccess?: number; lastAttempt?: number }): Promise<void> {
 		const dir = path.join(workspaceDir, "notifications");
 		await mkdir(dir, { recursive: true });
@@ -304,24 +318,24 @@ describe("startup notifier: per-source cache, backoff, and claims", () => {
 
 	it("does not re-show an already-shown target on later launches (shared across profiles)", async () => {
 		// First launch ("review" profile): the reminder for 1.1.0 fires.
-		const first = await run({ routes: { [NPM_METADATA_URL]: npmBody("1.1.0"), [ANNOUNCEMENTS_URL]: feedBody([]) } });
+		const first = await run({ routes: { [NPM_DIST_TAGS_URL]: npmBody("1.1.0"), [ANNOUNCEMENTS_URL]: feedBody([]) } });
 		expect(first.surface.messages).toHaveLength(1);
 		// Second launch ("default" profile, same global workspace): the same
 		// target must not remind again, regardless of the selected profile.
-		const second = await run({ routes: { [NPM_METADATA_URL]: npmBody("1.1.0"), [ANNOUNCEMENTS_URL]: feedBody([]) } });
+		const second = await run({ routes: { [NPM_DIST_TAGS_URL]: npmBody("1.1.0"), [ANNOUNCEMENTS_URL]: feedBody([]) } });
 		expect(second.surface.messages).toEqual([]);
 	});
 
 	it("reuses a fresh cache without new remote requests", async () => {
-		const first = await run({ routes: { [NPM_METADATA_URL]: npmBody("1.1.0"), [ANNOUNCEMENTS_URL]: feedBody([]) } });
+		const first = await run({ routes: { [NPM_DIST_TAGS_URL]: npmBody("1.1.0"), [ANNOUNCEMENTS_URL]: feedBody([]) } });
 		expect(first.requested).toHaveLength(2);
-		const second = await run({ routes: { [NPM_METADATA_URL]: npmBody("1.1.0"), [ANNOUNCEMENTS_URL]: feedBody([]) } });
+		const second = await run({ routes: { [NPM_DIST_TAGS_URL]: npmBody("1.1.0"), [ANNOUNCEMENTS_URL]: feedBody([]) } });
 		expect(second.requested).toHaveLength(0);
 		expect(second.surface.messages).toEqual([]);
 	});
 
 	it("does not re-display an already-displayed announcement on later launches", async () => {
-		const routes = { [ANNOUNCEMENTS_URL]: feedBody([announcement]), [NPM_METADATA_URL]: npmBody("1.0.0") };
+		const routes = { [ANNOUNCEMENTS_URL]: feedBody([announcement]), [NPM_DIST_TAGS_URL]: npmBody("1.0.0") };
 		const first = await run({ routes });
 		expect(first.surface.messages).toHaveLength(1);
 		const second = await run({ routes });
@@ -329,8 +343,8 @@ describe("startup notifier: per-source cache, backoff, and claims", () => {
 		expect(second.requested).toHaveLength(0);
 	});
 
-	it("two simultaneous launches display the same reminder only once", async () => {
-		const routes = { [NPM_METADATA_URL]: npmBody("1.1.0"), [ANNOUNCEMENTS_URL]: feedBody([]) };
+	it("overlapping launches each display the reminder at most once and history is recorded", async () => {
+		const routes = { [NPM_DIST_TAGS_URL]: npmBody("1.1.0"), [ANNOUNCEMENTS_URL]: feedBody([]) };
 		const { fetcher } = fakeFetch(routes);
 		const surfaceA = recordingSurface();
 		const surfaceB = recordingSurface();
@@ -345,13 +359,26 @@ describe("startup notifier: per-source cache, backoff, and claims", () => {
 			runStartupNotifications({ ...common, surface: surfaceA }),
 			runStartupNotifications({ ...common, surface: surfaceB }),
 		]);
-		expect(surfaceA.messages.length + surfaceB.messages.length).toBe(1);
+		// Overlapping launches are not synchronized: either may display the
+		// reminder, but no launch may display it twice.
+		expect(surfaceA.messages.length).toBeLessThanOrEqual(1);
+		expect(surfaceB.messages.length).toBeLessThanOrEqual(1);
+		expect(surfaceA.messages.length + surfaceB.messages.length).toBeGreaterThanOrEqual(1);
+		expect(surfaceA.messages.length + surfaceB.messages.length).toBeLessThanOrEqual(2);
+		// The displayed key is recorded for launches that evaluate later.
+		const history = JSON.parse(
+			await readFile(path.join(workspaceDir, "notifications", "displayed.json"), "utf8"),
+		) as { keys: string[] };
+		expect(history.keys).toContain("upgrade:1.1.0");
+		const third = recordingSurface();
+		await runStartupNotifications({ ...common, surface: third });
+		expect(third.messages).toEqual([]);
 	});
 
 	it("keeps previously validated cached announcements usable when a later response is invalid", async () => {
 		await seedFeedCache([announcement], staleTimestamps());
 		const { surface } = await run({
-			routes: { [ANNOUNCEMENTS_URL]: "{ not json", [NPM_METADATA_URL]: new Error("network down") },
+			routes: { [ANNOUNCEMENTS_URL]: "{ not json", [NPM_DIST_TAGS_URL]: new Error("network down") },
 		});
 		const warnings = surface.messages.filter((entry) => entry.level === "warning");
 		const infos = surface.messages.filter((entry) => entry.level === "info");
@@ -376,7 +403,7 @@ describe("startup notifier: per-source cache, backoff, and claims", () => {
 			maxInstalledVersionExclusive: "1.0.0",
 		};
 		const { surface } = await run({
-			routes: { [ANNOUNCEMENTS_URL]: feedBody([impossible]), [NPM_METADATA_URL]: new Error("network down") },
+			routes: { [ANNOUNCEMENTS_URL]: feedBody([impossible]), [NPM_DIST_TAGS_URL]: new Error("network down") },
 		});
 		expect(surface.messages.filter((entry) => entry.level === "info").map((entry) => entry.message)).toEqual([
 			`${announcement.message} — ${announcement.action}`,
@@ -407,7 +434,7 @@ describe("startup notifier: per-source cache, backoff, and claims", () => {
 		await seedNpmCache("1.1.0", staleTimestamps());
 		const controller = new AbortController();
 		const surface = recordingSurface();
-		const { fetcher } = fakeFetch({ [ANNOUNCEMENTS_URL]: "hang", [NPM_METADATA_URL]: "hang" });
+		const { fetcher } = fakeFetch({ [ANNOUNCEMENTS_URL]: "hang", [NPM_DIST_TAGS_URL]: "hang" });
 		const promise = runStartupNotifications({
 			installedVersion: "1.0.0",
 			workspaceDir,
@@ -429,7 +456,7 @@ describe("startup notifier: per-source cache, backoff, and claims", () => {
 		await seedNpmCache("1.1.0", staleTimestamps());
 		vi.useFakeTimers();
 		const surface = recordingSurface();
-		const { fetcher } = fakeFetch({ [ANNOUNCEMENTS_URL]: "hang", [NPM_METADATA_URL]: "hang" });
+		const { fetcher } = fakeFetch({ [ANNOUNCEMENTS_URL]: "hang", [NPM_DIST_TAGS_URL]: "hang" });
 		// Wait until the hanging check actually started (its timeout timer is
 		// scheduled) before advancing the fake clock — advancing starves the
 		// initial fs reads, a plain await does not.
@@ -457,8 +484,67 @@ describe("startup notifier: per-source cache, backoff, and claims", () => {
 		expect(surface.messages.filter((entry) => entry.level === "warning")).toEqual([]);
 	});
 
+	it.each([
+		["missing", "{}"],
+		["malformed", npmBody("not-a-version")],
+	])("keeps a valid npm cache when the top-level latest tag is %s", async (_case, invalidBody) => {
+		await seedNpmCache("1.1.0", staleTimestamps());
+		const { surface, requested } = await run({ routes: { [NPM_DIST_TAGS_URL]: invalidBody } });
+		expect(requested).toContain(NPM_DIST_TAGS_URL);
+		expect(surface.messages.filter((entry) => entry.level === "info").map((entry) => entry.message)).toEqual([
+			"pi-profile-switch 1.0.0 → 1.1.0: upgrade with npm install -g pi-profile-switch",
+		]);
+		expect(surface.messages.filter((entry) => entry.level === "warning").map((entry) => entry.message)).toEqual([
+			expect.stringMatching(/npm registry response invalid/),
+		]);
+		const cache = JSON.parse(await readFile(path.join(workspaceDir, "notifications", "npm-latest.json"), "utf8")) as {
+			data: { latest: string };
+			lastAttempt: number;
+		};
+		expect(cache.data).toEqual({ latest: "1.1.0" });
+		expect(cache.lastAttempt).toBe(nowMs);
+	});
+
+	it("still rejects an oversized dist-tags response without replacing valid cached data", async () => {
+		await seedNpmCache("1.1.0", staleTimestamps());
+		const oversized = JSON.stringify({ latest: "1.2.0", extra: "x".repeat(64 * 1024) });
+		const { surface } = await run({ routes: { [NPM_DIST_TAGS_URL]: oversized } });
+		expect(surface.messages.filter((entry) => entry.level === "warning").map((entry) => entry.message)).toEqual([
+			expect.stringMatching(/npm registry response invalid \(response exceeds 65536 bytes\)/),
+		]);
+		const cache = JSON.parse(await readFile(path.join(workspaceDir, "notifications", "npm-latest.json"), "utf8")) as {
+			data: { latest: string };
+		};
+		expect(cache.data).toEqual({ latest: "1.1.0" });
+	});
+
+	it("recovers an attempt-only npm cache after the existing failure backoff", async () => {
+		const failed = await run({ routes: { [NPM_DIST_TAGS_URL]: new Error("network down") } });
+		expect(failed.requested).toContain(NPM_DIST_TAGS_URL);
+		const cachePath = path.join(workspaceDir, "notifications", "npm-latest.json");
+		const attempt = JSON.parse(await readFile(cachePath, "utf8")) as {
+			schemaVersion: number;
+			data?: { latest: string };
+			lastSuccess: number;
+			lastAttempt: number;
+		};
+		expect(attempt).toEqual({ schemaVersion: 1, lastSuccess: 0, lastAttempt: nowMs });
+		const routes = { [NPM_DIST_TAGS_URL]: npmBody("1.1.0") };
+		const backedOff = await run({ routes, advanceMs: 29 * 60 * 1000 });
+		expect(backedOff.requested).not.toContain(NPM_DIST_TAGS_URL);
+		expect(backedOff.surface.messages).toEqual([]);
+		const recovered = await run({ routes, advanceMs: 31 * 60 * 1000 });
+		expect(recovered.requested).toContain(NPM_DIST_TAGS_URL);
+		expect(recovered.surface.messages.filter((entry) => entry.level === "info").map((entry) => entry.message)).toEqual([
+			"pi-profile-switch 1.0.0 → 1.1.0: upgrade with npm install -g pi-profile-switch",
+		]);
+		const refreshed = JSON.parse(await readFile(cachePath, "utf8")) as { data: { latest: string }; lastSuccess: number };
+		expect(refreshed.data).toEqual({ latest: "1.1.0" });
+		expect(refreshed.lastSuccess).toBe(nowMs + 31 * 60 * 1000);
+	});
+
 	it("backs off after a failed attempt and retries once the backoff elapses", async () => {
-		const routes = { [NPM_METADATA_URL]: new Error("network down"), [ANNOUNCEMENTS_URL]: new Error("network down") };
+		const routes = { [NPM_DIST_TAGS_URL]: new Error("network down"), [ANNOUNCEMENTS_URL]: new Error("network down") };
 		const first = await run({ routes });
 		expect(first.requested).toHaveLength(2);
 		// Within the backoff window the next launch does not retry.

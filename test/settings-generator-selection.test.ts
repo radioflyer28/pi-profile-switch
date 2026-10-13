@@ -1,12 +1,14 @@
 import { existsSync } from "node:fs";
-import { mkdir, lstat, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, lstat, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { resolveInitialProfile } from "../src/launcher/initial-profile.ts";
 import { defaultPlan, type ActivationPlan } from "../src/profile-resolver.ts";
 import { generateRuntimeDir, writeRuntimeFiles, type DiscoveryContext } from "../src/settings-generator.ts";
 import type { SkillEntry } from "../src/skill-registry.ts";
-import { addGlobalSkill, createPiFixture, type PiFixture } from "./helpers/pi-fixture.ts";
+import { expectSharedRuntimeFile } from "./helpers/runtime-file-assertions.ts";
+import { addGlobalExtension, addGlobalSkill, createPiFixture, type PiFixture } from "./helpers/pi-fixture.ts";
 
 let fixture: PiFixture;
 let savedHome: string | undefined;
@@ -55,7 +57,17 @@ function packageSkill(name: string, pkg: { source: string; root: string }): Skil
 }
 
 function selectionPlan(overrides: Partial<ActivationPlan>): ActivationPlan {
-	return { profile: "review", source: "global", filter: "selection", skills: [], extensions: [], ...overrides };
+	return {
+		profile: "review",
+		source: "global",
+		filter: "selection",
+		skills: [],
+		extensions: [],
+		// Typed plan fixture for the existing explicit-selection tests: both
+		// kinds are declared so their allowlist encoding keeps its meaning.
+		resourceSelection: { skills: true, extensions: true },
+		...overrides,
+	};
 }
 
 async function generatedSettings(runtimeDir: string): Promise<Record<string, unknown>> {
@@ -76,6 +88,7 @@ describe("generateRuntimeDir (named profile selection)", () => {
 		expect(settings.skills).toEqual([
 			path.join(fixture.agentDir, "skills", "alpha-skill", "SKILL.md"),
 			`-${path.join(result.runtimeDir, "skills", "beta-skill", "SKILL.md")}`,
+			`-${path.join(fixture.agentDir, "skills", "beta-skill", "SKILL.md")}`,
 		]);
 	});
 
@@ -89,7 +102,7 @@ describe("generateRuntimeDir (named profile selection)", () => {
 		await mkdir(libraryDir, { recursive: true });
 		await writeFile(path.join(libraryDir, "SKILL.md"), "---\nname: linked-skill\n---\n");
 		await mkdir(path.join(fixture.agentDir, "skills"), { recursive: true });
-		await symlink(libraryDir, path.join(fixture.agentDir, "skills", "linked-skill"), "dir");
+		await symlink(libraryDir, path.join(fixture.agentDir, "skills", "linked-skill"), process.platform === "win32" ? "junction" : "dir");
 
 		const plan = selectionPlan({ skills: [] });
 		const discovery: DiscoveryContext = { skills: [agentDirSkill("linked-skill")], packages: [] };
@@ -99,6 +112,7 @@ describe("generateRuntimeDir (named profile selection)", () => {
 
 		expect(settings.skills).toEqual([
 			`-${path.join(result.runtimeDir, "skills", "linked-skill", "SKILL.md")}`,
+			`-${path.join(fixture.agentDir, "skills", "linked-skill", "SKILL.md")}`,
 		]);
 	});
 
@@ -115,6 +129,48 @@ describe("generateRuntimeDir (named profile selection)", () => {
 		expect(settings.skills).toEqual([
 			`-${path.join(fixture.root, ".agents", "skills", "secret-skill", "SKILL.md")}`,
 		]);
+	});
+
+	it("carries the user's own skill exclusions into the generated settings", async () => {
+		// Discovery honors these exclusions, so the skills they hide never get a
+		// `-` entry of their own; dropping the user's entries would reveal them.
+		await writeFile(
+			path.join(fixture.agentDir, "settings.json"),
+			JSON.stringify({
+				skills: [
+					"!skills/**",
+					"+skills/kept-skill",
+					"/opt/shared-skills/extra/SKILL.md",
+					`-${path.join(fixture.agentDir, "skills", "absolute-hidden", "SKILL.md")}`,
+					"-~/.pi-test-agent-hidden/SKILL.md",
+					"-skills/relative-hidden/SKILL.md",
+				],
+			}),
+		);
+		const plan = selectionPlan({ skills: [agentDirSkill("kept-skill")] });
+		const discovery: DiscoveryContext = { skills: [agentDirSkill("kept-skill")], packages: [] };
+
+		const result = await generateRuntimeDir(plan, { agentDir: fixture.agentDir, discovery });
+		const settings = await generatedSettings(result.runtimeDir);
+
+		expect(settings.skills).toEqual([
+			path.join(fixture.agentDir, "skills", "kept-skill", "SKILL.md"),
+			"!skills/**",
+			"+skills/kept-skill",
+			`-${path.join(result.runtimeDir, "skills", "absolute-hidden", "SKILL.md")}`,
+			"-~/.pi-test-agent-hidden/SKILL.md",
+			"-skills/relative-hidden/SKILL.md",
+		]);
+	});
+
+	it("rewrites a ~ exclusion under the agent dir to its runtime mirror path", async () => {
+		const rel = path.relative(fixture.root, path.join(fixture.agentDir, "skills", "tilde-hidden", "SKILL.md"));
+		await writeFile(path.join(fixture.agentDir, "settings.json"), JSON.stringify({ skills: [`-~/${rel}`] }));
+
+		const result = await generateRuntimeDir(selectionPlan({}), { agentDir: fixture.agentDir, discovery: { skills: [], packages: [] } });
+		const settings = await generatedSettings(result.runtimeDir);
+
+		expect(settings.skills).toEqual([`-${path.join(result.runtimeDir, "skills", "tilde-hidden", "SKILL.md")}`]);
 	});
 
 	it("writes selected extensions as additive entry paths", async () => {
@@ -242,6 +298,88 @@ describe("generateRuntimeDir (named profile selection)", () => {
 		expect(bareSettings.defaultThinkingLevel).toBeUndefined();
 	});
 
+	it("adds native MCP gateways to defaultTools when tools are declared and a user server is enabled", async () => {
+		await writeFile(
+			path.join(fixture.agentDir, "mcp.json"),
+			JSON.stringify({ mcpServers: { github: { url: "https://x" } } }),
+		);
+
+		const result = await generateRuntimeDir(selectionPlan({ tools: ["read"] }), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		expect((await generatedSettings(result.runtimeDir)).defaultTools).toEqual(["read", "codemode", "tool_search"]);
+		const plan = JSON.parse(await readFile(path.join(result.runtimeDir, "pi-profile.json"), "utf8"));
+		expect(plan.mcpGateways).toBe(true);
+	});
+
+	it("adds gateways for an empty tools selection when a user server is enabled", async () => {
+		await writeFile(
+			path.join(fixture.agentDir, "mcp.json"),
+			JSON.stringify({ mcpServers: { github: { url: "https://x" } } }),
+		);
+
+		const result = await generateRuntimeDir(selectionPlan({ tools: [] }), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		expect((await generatedSettings(result.runtimeDir)).defaultTools).toEqual(["codemode", "tool_search"]);
+		const plan = JSON.parse(await readFile(path.join(result.runtimeDir, "pi-profile.json"), "utf8"));
+		expect(plan.mcpGateways).toBe(true);
+	});
+
+	it("does not add gateways when no MCP server is enabled", async () => {
+		await writeFile(
+			path.join(fixture.agentDir, "mcp.json"),
+			JSON.stringify({ mcpServers: { github: { url: "https://x", enabled: false } } }),
+		);
+
+		const result = await generateRuntimeDir(selectionPlan({ tools: ["read"] }), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		expect((await generatedSettings(result.runtimeDir)).defaultTools).toEqual(["read"]);
+		const plan = JSON.parse(await readFile(path.join(result.runtimeDir, "pi-profile.json"), "utf8"));
+		expect(plan.mcpGateways).toBeUndefined();
+	});
+
+	it("adds gateways when only a trusted project server is enabled", async () => {
+		await writeFile(path.join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: {} }));
+		await writeFile(
+			path.join(fixture.cwd, ".pi", "mcp.json"),
+			JSON.stringify({ mcpServers: { proj: { url: "https://proj" } } }),
+		);
+
+		const result = await generateRuntimeDir(selectionPlan({ tools: ["read"] }), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+			projectDir: fixture.cwd,
+		});
+
+		expect((await generatedSettings(result.runtimeDir)).defaultTools).toEqual(["read", "codemode", "tool_search"]);
+		const plan = JSON.parse(await readFile(path.join(result.runtimeDir, "pi-profile.json"), "utf8"));
+		expect(plan.mcpGateways).toBe(true);
+	});
+
+	it("does not add gateways when tools are undeclared", async () => {
+		await writeFile(
+			path.join(fixture.agentDir, "mcp.json"),
+			JSON.stringify({ mcpServers: { github: { url: "https://x" } } }),
+		);
+
+		const result = await generateRuntimeDir(selectionPlan({}), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		expect((await generatedSettings(result.runtimeDir)).defaultTools).toBeUndefined();
+		const plan = JSON.parse(await readFile(path.join(result.runtimeDir, "pi-profile.json"), "utf8"));
+		expect(plan.mcpGateways).toBeUndefined();
+	});
+
 	it("writes the launch plan file for the in-pi extension and writes APPEND_SYSTEM.md", async () => {
 		const result = await generateRuntimeDir(selectionPlan({ instructions: "Be picky." }), {
 			agentDir: fixture.agentDir,
@@ -254,7 +392,7 @@ describe("generateRuntimeDir (named profile selection)", () => {
 		expect(await readFile(path.join(result.runtimeDir, "APPEND_SYSTEM.md"), "utf8")).toBe("Be picky.");
 	});
 
-	it("filters the MCP servers into an instance mcp.json when mcps is declared", async () => {
+	it("materializes the merged snapshot into instance mcp.json when mcps is declared", async () => {
 		await writeFile(path.join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: { github: {}, missing: {} } }));
 
 		const result = await generateRuntimeDir(selectionPlan({ mcps: ["github"] }), {
@@ -264,9 +402,10 @@ describe("generateRuntimeDir (named profile selection)", () => {
 
 		const plan = JSON.parse(await readFile(path.join(result.runtimeDir, "pi-profile.json"), "utf8"));
 		expect(plan.mcps).toEqual(["github"]);
-		
+		const mcpStat = await lstat(path.join(result.runtimeDir, "mcp.json"));
+		expect(mcpStat.isSymbolicLink()).toBe(false);
 		const mcpInstance = JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8"));
-		expect(mcpInstance.mcpServers).toEqual({ github: {} });
+		expect(mcpInstance.mcpServers).toEqual({ github: {}, missing: { enabled: false } });
 	});
 
 	it("extracts MCP servers defined in ~/.agents/mcp.json and disables unallowed shared servers", async () => {
@@ -280,10 +419,7 @@ describe("generateRuntimeDir (named profile selection)", () => {
 				},
 			}),
 		);
-		await writeFile(
-			path.join(fixture.agentDir, "mcp.json"),
-			JSON.stringify({ mcpServers: { "agent-only": { url: "http://x" } } }),
-		);
+		await writeFile(path.join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: { "agent-only": { url: "http://x" } } }));
 
 		const result = await generateRuntimeDir(selectionPlan({ mcps: ["mcp-atlassian"] }), {
 			agentDir: fixture.agentDir,
@@ -293,11 +429,12 @@ describe("generateRuntimeDir (named profile selection)", () => {
 		const mcpInstance = JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8"));
 		expect(mcpInstance.mcpServers).toEqual({
 			"mcp-atlassian": { url: "http://127.0.0.1:10801/mcp", lifecycle: "keep-alive" },
-			"mcp-grafana": { disabled: true },
+			"mcp-grafana": { url: "http://127.0.0.1:10802/mcp", enabled: false },
+			"agent-only": { url: "http://x", enabled: false },
 		});
 	});
 
-	it("symlinks the real mcp.json when no mcp allowlist is declared", async () => {
+	it("always materializes the snapshot when no mcp allowlist is declared", async () => {
 		await writeFile(path.join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: { github: {} } }));
 
 		const result = await generateRuntimeDir(selectionPlan({ mcps: undefined }), {
@@ -305,9 +442,86 @@ describe("generateRuntimeDir (named profile selection)", () => {
 			discovery: { skills: [], packages: [] },
 		});
 
-		expect(await realpath(path.join(result.runtimeDir, "mcp.json"))).toBe(
-			await realpath(path.join(fixture.agentDir, "mcp.json")),
+		const mcpStat = await lstat(path.join(result.runtimeDir, "mcp.json"));
+		expect(mcpStat.isSymbolicLink()).toBe(false);
+		const mcpInstance = JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8"));
+		expect(mcpInstance.mcpServers).toEqual({ github: {} });
+	});
+
+	it("reports warnings when a malformed MCP source is skipped under an undeclared policy", async () => {
+		await mkdir(path.join(fixture.root, ".agents"), { recursive: true });
+		const malformedPath = path.join(fixture.root, ".agents", "mcp.json");
+		await writeFile(malformedPath, "{ invalid");
+		await writeFile(
+			path.join(fixture.agentDir, "mcp.json"),
+			JSON.stringify({ mcpServers: { github: { url: "https://x" } } }),
 		);
+
+		const result = await generateRuntimeDir(selectionPlan({}), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		expect(result.warnings).toEqual([expect.stringContaining(`MCP config is not valid JSON: ${path.resolve(malformedPath)}`)]);
+		const mcpInstance = JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8"));
+		expect(mcpInstance.mcpServers).toEqual({ github: { url: "https://x" } });
+	});
+
+	it("skips malformed sources even under explicit MCP policy", async () => {
+		await mkdir(path.join(fixture.root, ".agents"), { recursive: true });
+		const file = path.join(fixture.root, ".agents", "mcp.json");
+		await writeFile(file, "{ invalid");
+		const result = await generateRuntimeDir(selectionPlan({ mcps: ["github"] }), { agentDir: fixture.agentDir, discovery: { skills: [], packages: [] } });
+		expect(result.warnings).toContainEqual(expect.stringContaining(file));
+		expect(JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8")).mcpServers).toEqual({});
+	});
+
+	it("returns an empty warnings list when every MCP source is valid", async () => {
+		const result = await generateRuntimeDir(selectionPlan({}), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		expect(result.warnings).toEqual([]);
+	});
+
+	it("generates an empty mcps selection that disables discovered shared user servers", async () => {
+		await mkdir(path.join(fixture.root, ".agents"), { recursive: true });
+		await writeFile(
+			path.join(fixture.root, ".agents", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					shared: { url: "http://shared" },
+				},
+			}),
+		);
+		await writeFile(path.join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: {} }));
+
+		const result = await generateRuntimeDir(selectionPlan({ mcps: [] }), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		const mcpInstance = JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8"));
+		expect(mcpInstance.mcpServers).toEqual({ shared: { url: "http://shared", enabled: false } });
+		expect((await lstat(path.join(result.runtimeDir, "mcp.json"))).isSymbolicLink()).toBe(false);
+	});
+
+	it("does not mark project-sourced MCP servers disabled for an empty mcps selection", async () => {
+		await writeFile(path.join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: {} }));
+		await writeFile(
+			path.join(fixture.cwd, ".pi", "mcp.json"),
+			JSON.stringify({ mcpServers: { proj: { url: "https://proj" } } }),
+		);
+
+		const result = await generateRuntimeDir(selectionPlan({ mcps: [] }), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+			projectDir: fixture.cwd,
+		});
+
+		const mcpInstance = JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8"));
+		expect(mcpInstance.mcpServers).toEqual({});
 	});
 
 	it("symlinks auth state and links trust.json for named profiles", async () => {
@@ -316,18 +530,18 @@ describe("generateRuntimeDir (named profile selection)", () => {
 
 		const result = await generateRuntimeDir(selectionPlan({}), { agentDir: fixture.agentDir, discovery: { skills: [], packages: [] } });
 
-		expect(await realpath(path.join(result.runtimeDir, "auth.json"))).toBe(await realpath(path.join(fixture.agentDir, "auth.json")));
+		await expectSharedRuntimeFile(path.join(result.runtimeDir, "auth.json"), path.join(fixture.agentDir, "auth.json"));
 		// Pi reads its project-scope decision from this path: project-level
 		// resources belong to Pi's trust gate, not to the profile.
-		expect(await realpath(path.join(result.runtimeDir, "trust.json"))).toBe(await realpath(path.join(fixture.agentDir, "trust.json")));
+		await expectSharedRuntimeFile(path.join(result.runtimeDir, "trust.json"), path.join(fixture.agentDir, "trust.json"));
 	});
 
 	it("links trust.json even when the real agent dir has no trust store yet", async () => {
 		const result = await generateRuntimeDir(selectionPlan({}), { agentDir: fixture.agentDir, discovery: { skills: [], packages: [] } });
 
 		const link = path.join(result.runtimeDir, "trust.json");
-		expect((await lstat(link)).isSymbolicLink()).toBe(true);
-		expect(existsSync(link)).toBe(false); // dangling on purpose: Pi writes through it
+		await expectSharedRuntimeFile(link, path.join(fixture.agentDir, "trust.json"));
+		expect(existsSync(link)).toBe(false); // POSIX dangling link or Windows deferred state
 		expect(existsSync(path.join(fixture.agentDir, "trust.json"))).toBe(false);
 	});
 });
@@ -416,7 +630,7 @@ describe("generateRuntimeDir (project scope belongs to Pi)", () => {
 	it("keeps project-defined MCP servers enabled when the allowlist omits them", async () => {
 		await mkdir(path.join(fixture.agentDir), { recursive: true });
 		await writeFile(path.join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: { "agent-a": { url: "http://a" } } }));
-		await writeFile(path.join(fixture.cwd, ".mcp.json"), JSON.stringify({ mcpServers: { "proj-p": { url: "http://p" } } }));
+		await writeFile(path.join(fixture.cwd, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { "proj-p": { url: "http://p" } } }));
 
 		const result = await generateRuntimeDir(selectionPlan({ mcps: ["agent-a"] }), {
 			agentDir: fixture.agentDir,
@@ -430,6 +644,46 @@ describe("generateRuntimeDir (project scope belongs to Pi)", () => {
 		// narrow project-level servers.
 		expect(mcpInstance.mcpServers["proj-p"]).toBeUndefined();
 	});
+
+	it("always materializes mcp.json as a regular file", async () => {
+		await mkdir(path.join(fixture.agentDir), { recursive: true });
+		await writeFile(path.join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: { github: { url: "http://gh" } } }));
+
+		const result = await generateRuntimeDir(selectionPlan({}), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+		const mcpInstancePath = path.join(result.runtimeDir, "mcp.json");
+		const stat = await lstat(mcpInstancePath);
+		expect(stat.isSymbolicLink()).toBe(false);
+		expect(stat.isFile()).toBe(true);
+	});
+
+	it("materializes tool restriction without a server whitelist and represents empty list as deny-all", async () => {
+		await mkdir(path.join(fixture.agentDir), { recursive: true });
+		await writeFile(
+			path.join(fixture.agentDir, "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					github: { url: "http://gh" },
+					linear: { command: "linear" },
+				},
+			}),
+		);
+
+		const plan = selectionPlan({
+			mcpTools: { github: ["search"], linear: [] },
+		});
+
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		const instanceMcp = JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8"));
+		expect(instanceMcp.mcpServers.github.toolExposure).toEqual({ "*": "hidden", search: "direct" });
+		expect(instanceMcp.mcpServers.linear.toolExposure).toEqual({ "*": "hidden" });
+	});
 });
 
 describe("generateRuntimeDir (default profile, unchanged)", () => {
@@ -438,6 +692,15 @@ describe("generateRuntimeDir (default profile, unchanged)", () => {
 		const settings = await generatedSettings(result.runtimeDir);
 
 		expect(settings.defaultProjectTrust).toBeUndefined();
+	});
+
+	it("materializes the merged snapshot even for the default profile", async () => {
+		await writeFile(path.join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: { github: { url: "http://gh" } } }));
+
+		const result = await generateRuntimeDir(defaultPlan(), { agentDir: fixture.agentDir });
+		const mcpInstance = JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8"));
+		expect(mcpInstance.mcpServers).toEqual({ github: { url: "http://gh" } });
+		expect((await lstat(path.join(result.runtimeDir, "mcp.json"))).isSymbolicLink()).toBe(false);
 	});
 });
 
@@ -481,7 +744,7 @@ describe("writeRuntimeFiles (in-session switch rewrite)", () => {
 			discovery: { skills: [], packages: [] },
 		});
 
-		expect(await realpath(path.join(first.runtimeDir, "trust.json"))).toBe(await realpath(path.join(fixture.agentDir, "trust.json")));
+		await expectSharedRuntimeFile(path.join(first.runtimeDir, "trust.json"), path.join(fixture.agentDir, "trust.json"));
 	});
 
 	it("keeps a dangling trust.json symlink when switching to a named profile", async () => {
@@ -489,7 +752,7 @@ describe("writeRuntimeFiles (in-session switch rewrite)", () => {
 		// the link itself is profile-independent.
 		const first = await generateRuntimeDir(defaultPlan(), { agentDir: fixture.agentDir });
 		const trustLink = path.join(first.runtimeDir, "trust.json");
-		expect((await lstat(trustLink)).isSymbolicLink()).toBe(true);
+		await expectSharedRuntimeFile(trustLink, path.join(fixture.agentDir, "trust.json"));
 		expect(existsSync(trustLink)).toBe(false); // dangling: target absent
 
 		await writeRuntimeFiles(first.runtimeDir, selectionPlan({}), {
@@ -497,7 +760,7 @@ describe("writeRuntimeFiles (in-session switch rewrite)", () => {
 			discovery: { skills: [], packages: [] },
 		});
 
-		expect((await lstat(trustLink)).isSymbolicLink()).toBe(true);
+		await expectSharedRuntimeFile(trustLink, path.join(fixture.agentDir, "trust.json"));
 		expect(existsSync(path.join(fixture.agentDir, "trust.json"))).toBe(false);
 	});
 
@@ -511,8 +774,532 @@ describe("writeRuntimeFiles (in-session switch rewrite)", () => {
 
 		await writeRuntimeFiles(first.runtimeDir, defaultPlan(), { agentDir: fixture.agentDir });
 
-		expect(await realpath(path.join(first.runtimeDir, "trust.json"))).toBe(
-			await realpath(path.join(fixture.agentDir, "trust.json")),
+		await expectSharedRuntimeFile(path.join(first.runtimeDir, "trust.json"), path.join(fixture.agentDir, "trust.json"));
+	});
+});
+
+describe("independent per-kind materialization (fix-undeclared-resource-filtering)", () => {
+	async function writeUserSettings(settings: unknown): Promise<void> {
+		await writeFile(path.join(fixture.agentDir, "settings.json"), JSON.stringify(settings));
+	}
+
+	it("omitted skills preserve native settings and native exclusion/inclusion entries", async () => {
+		await writeUserSettings({ skills: ["/opt/shared/SKILL.md", "!skills/**", "+skills/keep"] });
+
+		const plan = selectionPlan({ resourceSelection: { skills: false, extensions: true } });
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [agentDirSkill("ignored-snapshot")], packages: [] },
+		});
+
+		expect((await generatedSettings(result.runtimeDir)).skills).toEqual([
+			"/opt/shared/SKILL.md",
+			"!skills/**",
+			"+skills/keep",
+		]);
+	});
+
+	it("omitted extensions preserve native settings-only paths and control entries", async () => {
+		await mkdir(path.join(fixture.agentDir, "extensions"), { recursive: true });
+		await writeUserSettings({ extensions: ["/opt/pi-resources/review-guard/index.ts", "-builtin:mcp"] });
+
+		const plan = selectionPlan({ resourceSelection: { skills: true, extensions: false } });
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		// The real directory is exposed by the conditional link, not an additive
+		// plain include, so only the native entries remain in the array.
+		expect((await generatedSettings(result.runtimeDir)).extensions).toEqual([
+			"/opt/pi-resources/review-guard/index.ts",
+			"-builtin:mcp",
+		]);
+	});
+
+	it("keeps non-escaping relative native extension paths for the mirrored kind", async () => {
+		await mkdir(path.join(fixture.agentDir, "extensions"), { recursive: true });
+		await writeUserSettings({ extensions: ["./extra.ts"] });
+
+		const result = await generateRuntimeDir(selectionPlan({ resourceSelection: { skills: true, extensions: false } }), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		// The instance mirrors the real extensions directory, so a relative path
+		// under the agent dir keeps its native relative meaning.
+		expect((await generatedSettings(result.runtimeDir)).extensions).toEqual(["./extra.ts"]);
+	});
+
+	it("appends targeted native-base exclusions for an overlay on an omitted skill kind", async () => {
+		const plan = selectionPlan({
+			resourceSelection: { skills: false, extensions: true },
+			disabledSkills: [agentDirSkill("beta-skill"), agentsSkill("secret-skill")],
+		});
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		expect((await generatedSettings(result.runtimeDir)).skills).toEqual([
+			`-${path.join(result.runtimeDir, "skills", "beta-skill", "SKILL.md")}`,
+			`-${path.join(fixture.agentDir, "skills", "beta-skill", "SKILL.md")}`,
+			`-${agentsSkill("secret-skill").filePath}`,
+		]);
+	});
+
+	it("appends targeted native-base exclusions for an overlay on an omitted extension kind", async () => {
+		await mkdir(path.join(fixture.agentDir, "extensions"), { recursive: true });
+		const entry = path.join(fixture.agentDir, "extensions", "beta.ts");
+		const plan = selectionPlan({
+			resourceSelection: { skills: true, extensions: false },
+			disabledExtensions: [{ id: "beta", entry, origin: "local" }],
+		});
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		expect((await generatedSettings(result.runtimeDir)).extensions).toEqual([
+			`-${path.join(result.runtimeDir, "extensions", "beta.ts")}`,
+		]);
+	});
+
+	it("carries native built-in extension controls through a declared selection", async () => {
+		await writeUserSettings({ extensions: ["-builtin:mcp", "+builtin:codemode"] });
+
+		const plan = selectionPlan({ extensions: [{ id: "review-guard", entry: "/opt/pi-resources/review-guard/index.ts" }] });
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		expect((await generatedSettings(result.runtimeDir)).extensions).toEqual([
+			"/opt/pi-resources/review-guard/index.ts",
+			"-builtin:mcp",
+			"+builtin:codemode",
+		]);
+	});
+
+	it("keeps an explicitly empty native package filter empty for the undeclared kind", async () => {
+		const pkg = { source: path.join(fixture.root, "pkg"), root: path.join(fixture.root, "pkg") };
+		await writeUserSettings({ packages: [{ source: pkg.source, skills: [] }] });
+
+		const plan = selectionPlan({
+			resourceSelection: { skills: false, extensions: true },
+			extensions: [{ id: "pkg-ext", entry: path.join(pkg.root, "extensions", "pkg-ext.ts"), origin: "package" }],
+		});
+		const result = await generateRuntimeDir(plan, { agentDir: fixture.agentDir, discovery: { skills: [], packages: [pkg] } });
+
+		expect((await generatedSettings(result.runtimeDir)).packages).toEqual([
+			{ source: pkg.source, skills: [], extensions: ["extensions/pkg-ext.ts"] },
+		]);
+	});
+
+	it("narrows extensions while preserving an undeclared skill-filter meaning", async () => {
+		const pkg = { source: path.join(fixture.root, "pkg"), root: path.join(fixture.root, "pkg") };
+		await writeUserSettings({ packages: [{ source: pkg.source, skills: ["skills/keep"] }] });
+
+		const plan = selectionPlan({
+			resourceSelection: { skills: false, extensions: true },
+			extensions: [{ id: "pkg-ext", entry: path.join(pkg.root, "extensions", "pkg-ext.ts"), origin: "package" }],
+		});
+		const result = await generateRuntimeDir(plan, { agentDir: fixture.agentDir, discovery: { skills: [], packages: [pkg] } });
+
+		expect((await generatedSettings(result.runtimeDir)).packages).toEqual([
+			{ source: pkg.source, skills: ["skills/keep"], extensions: ["extensions/pkg-ext.ts"] },
+		]);
+	});
+
+	it("narrows skills while preserving an undeclared extension-filter meaning", async () => {
+		const pkg = { source: path.join(fixture.root, "pkg"), root: path.join(fixture.root, "pkg") };
+		await writeUserSettings({ packages: [{ source: pkg.source, extensions: ["extensions/keep.ts"] }] });
+
+		const plan = selectionPlan({
+			resourceSelection: { skills: true, extensions: false },
+			skills: [packageSkill("pkg-skill", pkg)],
+		});
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [packageSkill("pkg-skill", pkg)], packages: [pkg] },
+		});
+
+		expect((await generatedSettings(result.runtimeDir)).packages).toEqual([
+			{ source: pkg.source, extensions: ["extensions/keep.ts"], skills: ["skills/pkg-skill/SKILL.md"] },
+		]);
+	});
+
+	it("appends overlay package exclusions to an undeclared kind's native filter", async () => {
+		const pkg = { source: path.join(fixture.root, "pkg"), root: path.join(fixture.root, "pkg") };
+		const disabledEntry = path.join(pkg.root, "extensions", "e1.ts");
+		await writeUserSettings({ packages: [{ source: pkg.source, extensions: ["extensions/keep.ts"] }] });
+
+		const plan = selectionPlan({
+			resourceSelection: { skills: false, extensions: false },
+			disabledExtensions: [{ id: "pkg-ext", entry: disabledEntry, origin: "package" }],
+		});
+		const result = await generateRuntimeDir(plan, { agentDir: fixture.agentDir, discovery: { skills: [], packages: [pkg] } });
+
+		expect((await generatedSettings(result.runtimeDir)).packages).toEqual([
+			{ source: pkg.source, extensions: ["extensions/keep.ts", "-extensions/e1.ts"] },
+		]);
+	});
+
+	it("keeps an undeclared kind's package entry untouched when the profile declares the other kind", async () => {
+		const pkg = { source: path.join(fixture.root, "pkg"), root: path.join(fixture.root, "pkg") };
+		await writeUserSettings({ packages: [{ source: pkg.source, autoload: false, prompts: ["review-*"] }] });
+
+		const plan = selectionPlan({
+			resourceSelection: { skills: false, extensions: true },
+			extensions: [{ id: "pkg-ext", entry: path.join(pkg.root, "extensions", "pkg-ext.ts"), origin: "package" }],
+		});
+		const result = await generateRuntimeDir(plan, { agentDir: fixture.agentDir, discovery: { skills: [], packages: [pkg] } });
+
+		expect((await generatedSettings(result.runtimeDir)).packages).toEqual([
+			{ source: pkg.source, autoload: false, prompts: ["review-*"], extensions: ["extensions/pkg-ext.ts"] },
+		]);
+	});
+
+	it("remaps absolute and ~ native skill overrides under the agent dir for an omitted kind", async () => {
+		// Pi matches `!`/`+`/`-` entries lexically against the raw discovered path.
+		// AgentDir skills surface only through the instance's runtime-mirror
+		// symlink, so a native absolute/`~` override under the agent dir must be
+		// rewritten to the mirror path or it silently matches nothing.
+		await writeUserSettings({
+			skills: [
+				`-${path.join(fixture.agentDir, "skills", "hidden-skill", "SKILL.md")}`,
+				`+${path.join(fixture.agentDir, "skills", "kept-skill", "SKILL.md")}`,
+				`-~/${path.relative(fixture.root, path.join(fixture.agentDir, "skills", "tilde-hidden", "SKILL.md"))}`,
+				"-skills/relative-hidden/SKILL.md",
+				"-~/.agents/skills/agents-hidden/SKILL.md",
+			],
+		});
+		const plan = selectionPlan({ resourceSelection: { skills: false, extensions: true } });
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		expect((await generatedSettings(result.runtimeDir)).skills).toEqual([
+			`-${path.join(result.runtimeDir, "skills", "hidden-skill", "SKILL.md")}`,
+			`+${path.join(result.runtimeDir, "skills", "kept-skill", "SKILL.md")}`,
+			// Real Pi treats a `~` override as a no-op, so it is preserved verbatim
+			// rather than remapped into an effective exclusion.
+			`-~/${path.relative(fixture.root, path.join(fixture.agentDir, "skills", "tilde-hidden", "SKILL.md"))}`,
+			"-skills/relative-hidden/SKILL.md",
+			"-~/.agents/skills/agents-hidden/SKILL.md",
+		]);
+	});
+
+	it("rewrites a relative local package source to its resolved root", async () => {
+		const root = path.resolve(fixture.agentDir, "..", "shared-pkg");
+		await writeUserSettings({ packages: [{ source: "../shared-pkg", skills: ["skills/keep"] }] });
+
+		const result = await generateRuntimeDir(selectionPlan({ resourceSelection: { skills: false, extensions: false } }), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [{ source: "../shared-pkg", root }] },
+		});
+
+		// A user-scope relative source resolves from the agent dir; the instance
+		// moves that root, so the emitted source must carry the resolved path.
+		expect((await generatedSettings(result.runtimeDir)).packages).toEqual([{ source: root, skills: ["skills/keep"] }]);
+	});
+
+	it("keeps an unresolved package's native declaration for an undeclared kind", async () => {
+		await writeUserSettings({ packages: [{ source: "npm:not-installed", skills: ["skills/keep"] }] });
+
+		const result = await generateRuntimeDir(selectionPlan({ resourceSelection: { skills: false, extensions: false } }), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [{ source: "npm:not-installed", root: undefined }] },
+		});
+
+		// Read-only discovery cannot resolve the root; the native declaration must
+		// pass through instead of becoming an empty or discovery-derived allowlist.
+		expect((await generatedSettings(result.runtimeDir)).packages).toEqual([
+			{ source: "npm:not-installed", skills: ["skills/keep"] },
+		]);
+	});
+
+	it("keeps native extension control patterns for the mirrored kind", async () => {
+		await mkdir(path.join(fixture.agentDir, "extensions"), { recursive: true });
+		// The canonical shape `pi config` writes: a top-level relative control.
+		await writeUserSettings({
+			extensions: [
+				"-extensions/x.ts",
+				"!extensions/legacy/**",
+				"+extensions/keep.ts",
+				"-builtin:mcp",
+				"/opt/pi-resources/one-off.ts",
+				"~/.config/pi/extra.ts",
+			],
+		});
+		const plan = selectionPlan({ resourceSelection: { skills: true, extensions: false } });
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		// Relative controls match the mirrored `rel`; `builtin:`/`~`/absolute keep
+		// their native spelling.
+		expect((await generatedSettings(result.runtimeDir)).extensions).toEqual([
+			"-extensions/x.ts",
+			"!extensions/legacy/**",
+			"+extensions/keep.ts",
+			"-builtin:mcp",
+			"/opt/pi-resources/one-off.ts",
+			"~/.config/pi/extra.ts",
+		]);
+	});
+
+	it("re-anchors escaping relative skill includes and their matching overrides", async () => {
+		await writeUserSettings({
+			skills: [
+				"../shared-skills",
+				"!../shared-skills/foo/SKILL.md",
+				"!skills/**",
+				`!${path.join(fixture.agentDir, "skills", "**")}`,
+			],
+		});
+		const plan = selectionPlan({ resourceSelection: { skills: false, extensions: true } });
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		const escaped = path.resolve(fixture.agentDir, "..", "shared-skills");
+		expect((await generatedSettings(result.runtimeDir)).skills).toEqual([
+			escaped,
+			`!${path.join(escaped, "foo", "SKILL.md")}`,
+			// Non-escaping relatives still match the instance's mirrored subtree.
+			"!skills/**",
+			// An absolute agentDir control still maps to the runtime mirror.
+			`!${path.join(result.runtimeDir, "skills", "**")}`,
+		]);
+	});
+
+	it("re-anchors escaping relative extension includes and their matching overrides", async () => {
+		await writeUserSettings({ extensions: ["../shared-extension.ts", "-../shared-extension.ts"] });
+		const plan = selectionPlan({ resourceSelection: { skills: true, extensions: false } });
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		const escaped = path.resolve(fixture.agentDir, "..", "shared-extension.ts");
+		expect((await generatedSettings(result.runtimeDir)).extensions).toEqual([escaped, `-${escaped}`]);
+	});
+});
+
+describe("conditional extension mirror (fix-undeclared-resource-filtering)", () => {
+	function omittedExtensionsPlan(): ActivationPlan {
+		return selectionPlan({ resourceSelection: { skills: true, extensions: false } });
+	}
+
+	it("links the instance extensions path to the real one for an omitted selection, dangling allowed", async () => {
+		const result = await generateRuntimeDir(omittedExtensionsPlan(), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		const link = path.join(result.runtimeDir, "extensions");
+		expect((await lstat(link)).isSymbolicLink()).toBe(true);
+		expect(await readlink(link)).toBe(path.join(fixture.agentDir, "extensions"));
+		// The target is not created or populated.
+		expect(existsSync(path.join(fixture.agentDir, "extensions"))).toBe(false);
+	});
+
+	it("links an existing real extensions directory without touching its contents", async () => {
+		await mkdir(path.join(fixture.agentDir, "extensions"), { recursive: true });
+		await writeFile(path.join(fixture.agentDir, "extensions", "a.ts"), "export default 1");
+
+		const result = await generateRuntimeDir(omittedExtensionsPlan(), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		expect(await readlink(path.join(result.runtimeDir, "extensions"))).toBe(
+			path.join(fixture.agentDir, "extensions"),
 		);
+		expect(await readFile(path.join(fixture.agentDir, "extensions", "a.ts"), "utf8")).toBe("export default 1");
+	});
+
+	it("has no generated link for a declared extension selection", async () => {
+		const plan = selectionPlan({ extensions: [{ id: "e", entry: "/opt/x/index.ts" }] });
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		await expect(lstat(path.join(result.runtimeDir, "extensions"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("removes a stale generated link when an in-place rewrite declares extensions", async () => {
+		const first = await generateRuntimeDir(omittedExtensionsPlan(), {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+		expect((await lstat(path.join(first.runtimeDir, "extensions"))).isSymbolicLink()).toBe(true);
+
+		await writeRuntimeFiles(
+			first.runtimeDir,
+			selectionPlan({ extensions: [{ id: "e", entry: "/opt/x/index.ts" }] }),
+			{ agentDir: fixture.agentDir, discovery: { skills: [], packages: [] } },
+		);
+
+		await expect(lstat(path.join(first.runtimeDir, "extensions"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("refuses real content at the instance extensions path before any managed write", async () => {
+		const runtimeDir = path.join(fixture.root, "runtime");
+		await mkdir(path.join(runtimeDir, "extensions"), { recursive: true });
+		await writeFile(path.join(runtimeDir, "extensions", "real.ts"), "real");
+		const sentinelSettings = "settings sentinel";
+		const sentinelPlan = "plan sentinel";
+		await writeFile(path.join(runtimeDir, "settings.json"), sentinelSettings);
+		await writeFile(path.join(runtimeDir, "pi-profile.json"), sentinelPlan);
+
+		await expect(
+			writeRuntimeFiles(runtimeDir, omittedExtensionsPlan(), {
+				agentDir: fixture.agentDir,
+				discovery: { skills: [], packages: [] },
+			}),
+		).rejects.toThrow(/real directory.*will not delete or overwrite/);
+
+		// Refusal happens before managed writes and never touches the real content.
+		expect(await readFile(path.join(runtimeDir, "settings.json"), "utf8")).toBe(sentinelSettings);
+		expect(await readFile(path.join(runtimeDir, "pi-profile.json"), "utf8")).toBe(sentinelPlan);
+		expect(await readFile(path.join(runtimeDir, "extensions", "real.ts"), "utf8")).toBe("real");
+	});
+});
+
+describe("native plain-include overlay exclusion (fix-undeclared-resource-filtering)", () => {
+	it("excludes a disabled skill through both its real and mirrored lexical routes", async () => {
+		const vendorSkill: SkillEntry = {
+			name: "vendor-x",
+			filePath: path.join(fixture.agentDir, "vendor", "x", "SKILL.md"),
+			source: "local",
+			scope: "user",
+			origin: "top-level",
+		};
+		// The native plain include loads the file at its real absolute path.
+		await writeFile(
+			path.join(fixture.agentDir, "settings.json"),
+			JSON.stringify({ skills: [vendorSkill.filePath] }),
+		);
+		const plan = selectionPlan({
+			resourceSelection: { skills: false, extensions: true },
+			disabledSkills: [vendorSkill],
+		});
+		const result = await generateRuntimeDir(plan, {
+			agentDir: fixture.agentDir,
+			discovery: { skills: [], packages: [] },
+		});
+
+		const skills = (await generatedSettings(result.runtimeDir)).skills as string[];
+		expect(skills).toContain(vendorSkill.filePath); // the native include stays
+		expect(skills).toContain(`-${vendorSkill.filePath}`); // real lexical route
+		expect(skills).toContain(`-${path.join(result.runtimeDir, "vendor", "x", "SKILL.md")}`); // mirror route
+	});
+});
+
+describe("declared-selection extension-path refusal (fix-undeclared-resource-filtering)", () => {
+	it.each([
+		["empty", { extensions: [] }],
+		["nonempty", { extensions: [{ id: "declared", entry: "/opt/pi-resources/declared/index.ts" }] }],
+	] as Array<[string, Partial<ActivationPlan>]>, )("refuses real content at the instance extension path for a declared %s selection", async (_label, definition) => {
+		const runtimeDir = path.join(fixture.root, `runtime-${_label}`);
+		await mkdir(path.join(runtimeDir, "extensions", "sneaky"), { recursive: true });
+		await writeFile(path.join(runtimeDir, "extensions", "sneaky", "index.ts"), "export default 1");
+		const sentinelSettings = "settings sentinel";
+		await writeFile(path.join(runtimeDir, "settings.json"), sentinelSettings);
+
+		await expect(
+			writeRuntimeFiles(runtimeDir, selectionPlan(definition), {
+				agentDir: fixture.agentDir,
+				discovery: { skills: [], packages: [] },
+			}),
+		).rejects.toThrow(/real directory.*will not delete or overwrite/);
+
+		// Refusal happens before managed writes and never deletes or adopts content.
+		expect(await readFile(path.join(runtimeDir, "settings.json"), "utf8")).toBe(sentinelSettings);
+		expect(await readFile(path.join(runtimeDir, "extensions", "sneaky", "index.ts"), "utf8")).toBe("export default 1");
+	});
+});
+
+describe("restrictive partial runtime materialization", () => {
+	it("keeps all-missing resource selections empty and user resources excluded", async () => {
+		await addGlobalSkill(fixture, "unselected");
+		await addGlobalExtension(fixture, "unselected");
+		await writeFile(path.join(fixture.agentDir, "mcp.json"), '{"mcpServers":{"unselected":{"command":"fixture"}}}');
+		const dir = path.join(fixture.profileSwitchDir, "profiles");
+		await mkdir(dir, { recursive: true });
+		const file = path.join(dir, "review.json");
+		const content = '{"skills":["missing"],"extensions":["missing"],"mcps":["missing"],"unknownField":"ignored"}';
+		await writeFile(file, content);
+		const resolved = await resolveInitialProfile("review", { agentDir: fixture.agentDir, cwd: fixture.cwd });
+		const result = await generateRuntimeDir(resolved.plan, { agentDir: fixture.agentDir, discovery: resolved.discovery, projectDir: resolved.projectDir });
+		const settings = await generatedSettings(result.runtimeDir);
+		expect(settings.extensions).toEqual([]);
+		expect(settings.skills).toEqual([
+			`-${path.join(result.runtimeDir, "skills", "unselected", "SKILL.md")}`,
+			`-${path.join(fixture.agentDir, "skills", "unselected", "SKILL.md")}`,
+		]);
+		expect(JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8")).mcpServers).toEqual({ unselected: { command: "fixture", enabled: false } });
+		const plan = JSON.parse(await readFile(path.join(result.runtimeDir, "pi-profile.json"), "utf8"));
+		expect(plan.mcps).toEqual([]);
+		for (const kind of ["skill", "extension", "mcp", "catalog"]) expect(plan.diagnostics.some((issue: { kind: string }) => issue.kind === kind)).toBe(true);
+		expect(plan.resolved).toEqual({ skills: [], extensions: [] });
+		expect(settings.unknownField).toBeUndefined();
+		expect(await readFile(file, "utf8")).toBe(content);
+	});
+
+	it("preserves partial MCP restrictions, dormant keys, and source/project boundaries with a bad later source", async () => {
+		await mkdir(path.join(fixture.root, ".agents"), { recursive: true });
+		const valid = path.join(fixture.root, ".agents", "mcp.json");
+		const content = '{"mcpServers":{"kept":{"command":"fixture"},"disabled":{"command":"disabled","enabled":false},"unselected":{"command":"other"}}}';
+		await writeFile(valid, content);
+		const invalid = path.join(fixture.agentDir, "mcp.json");
+		await writeFile(invalid, "{ bad");
+		const project = path.join(fixture.cwd, ".pi", "mcp.json");
+		await writeFile(project, '{"mcpServers":{"project":{"command":"project"}}}');
+		const result = await generateRuntimeDir(selectionPlan({ mcps: ["kept"], mcpTools: { kept: ["opaque"], missing: [], disabled: [], project: [], unselected: [] } }), { agentDir: fixture.agentDir, discovery: { skills: [], packages: [] }, projectDir: fixture.cwd });
+		const servers = JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8")).mcpServers;
+		expect(servers).toEqual({ kept: { command: "fixture", toolExposure: { "*": "hidden", opaque: "direct" } }, disabled: { command: "disabled", enabled: false }, unselected: { command: "other", enabled: false } });
+		const plan = JSON.parse(await readFile(path.join(result.runtimeDir, "pi-profile.json"), "utf8"));
+		expect(Object.keys(plan.mcpTools).sort()).toEqual(["disabled", "kept", "missing", "project", "unselected"]);
+		expect(plan.diagnostics.some((issue: { filePath?: string }) => issue.filePath === invalid)).toBe(true);
+		for (const name of ["missing", "disabled", "project", "unselected"]) expect(plan.diagnostics.some((issue: { reference?: string }) => issue.reference === name)).toBe(true);
+		expect(await readFile(valid, "utf8")).toBe(content);
+		expect(await readFile(invalid, "utf8")).toBe("{ bad");
+		expect(await readFile(project, "utf8")).toBe('{"mcpServers":{"project":{"command":"project"}}}');
+	});
+
+	it("persists diagnostics once and uses the final source snapshot without discarding other warnings", async () => {
+		const issue = { kind: "skill", code: "unknown-reference", reference: "missing", message: 'profile "review": missing skill; not loaded' };
+		const result = await generateRuntimeDir(selectionPlan({ diagnostics: [issue, { ...issue }], unmatched: ["overlay skill:zero-*"] }), { agentDir: fixture.agentDir, discovery: { skills: [], packages: [] } });
+		const plan = JSON.parse(await readFile(path.join(result.runtimeDir, "pi-profile.json"), "utf8"));
+		expect(plan.diagnostics.filter((entry: { reference?: string }) => entry.reference === "missing")).toEqual([issue]);
+		expect(result.warnings.filter((warning) => warning === issue.message)).toHaveLength(1);
+		expect(result.warnings.some((warning) => warning.includes("overlay skill:zero-*"))).toBe(true);
+	});
+
+	it("uses final MCP source/policy diagnostics rather than stale earlier content errors", async () => {
+		const file = path.join(fixture.agentDir, "mcp.json");
+		await writeFile(file, '{"mcpServers":{"kept":{"command":"fixture","enabled":false}}}');
+		const stale = { kind: "mcp-source", code: "invalid-source", filePath: file, message: "stale content error" };
+		const result = await generateRuntimeDir(selectionPlan({ mcps: ["kept"], mcpTools: { kept: [] }, diagnostics: [stale] }), { agentDir: fixture.agentDir, discovery: { skills: [], packages: [] } });
+		expect(result.warnings).not.toContain("stale content error");
+		expect(result.warnings.some((message) => message.includes("remains disabled"))).toBe(true);
+		const plan = JSON.parse(await readFile(path.join(result.runtimeDir, "pi-profile.json"), "utf8"));
+		expect(plan.diagnostics.some((issue: { kind: string }) => issue.kind === "mcp-source")).toBe(false);
+		expect(JSON.parse(await readFile(path.join(result.runtimeDir, "mcp.json"), "utf8")).mcpServers.kept).toEqual({ command: "fixture", enabled: false });
+	});
+
+	it("propagates genuine MCP IO errors before rewriting managed files", async () => {
+		const first = await generateRuntimeDir(selectionPlan({}), { agentDir: fixture.agentDir, discovery: { skills: [], packages: [] } });
+		const before = await readFile(path.join(first.runtimeDir, "settings.json"), "utf8");
+		await mkdir(path.join(fixture.agentDir, "mcp.json"));
+		await expect(writeRuntimeFiles(first.runtimeDir, selectionPlan({ mcps: [] }), { agentDir: fixture.agentDir, discovery: { skills: [], packages: [] } })).rejects.toMatchObject({ code: "EISDIR" });
+		expect(await readFile(path.join(first.runtimeDir, "settings.json"), "utf8")).toBe(before);
 	});
 });

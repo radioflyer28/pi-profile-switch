@@ -29,13 +29,14 @@ import { DefaultPackageManager, SettingsManager, type PackageManager } from "@ea
 import { minimatch } from "minimatch";
 
 import { isRecord } from "./json-file.ts";
+import type { ResolutionDiagnostic } from "./profile-resolver.ts";
 
 export interface DiscoveredPackage {
 	/** Selectable package name: package.json "name", or the source minus its
 	 *  npm:/git:/github: prefix (and any version spec) when unreadable. */
 	name: string;
 	/** The source string exactly as configured in the user's settings
-	 *  (e.g. "npm:pi-mcp-adapter"); accepted as a reference alias. */
+	 *  (e.g. "npm:pi-web-access"); accepted as a reference alias. */
 	source: string;
 	/** Absolute install/local root of the package. */
 	root: string;
@@ -75,6 +76,7 @@ export interface SelectedExtension {
 export interface SelectExtensionsResult {
 	entries: SelectedExtension[];
 	unmatched: string[];
+	diagnostics?: ResolutionDiagnostic[];
 }
 
 function toPosix(filePath: string): string {
@@ -84,8 +86,10 @@ function toPosix(filePath: string): string {
 async function isFile(filePath: string): Promise<boolean> {
 	try {
 		return (await stat(filePath)).isFile();
-	} catch {
-		return false;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ENOTDIR") return false;
+		throw error;
 	}
 }
 
@@ -181,6 +185,10 @@ export class DiscoveredExtensions {
 	async select(references: string[]): Promise<SelectExtensionsResult> {
 		const byPath = new Map<string, SelectedExtension>();
 		const unmatched: string[] = [];
+		const diagnostics: ResolutionDiagnostic[] = [];
+		const diagnose = (reference: string, code: string, cause: string, filePath?: string): void => {
+			diagnostics.push({ kind: "extension", code, reference, message: `${cause}; not loaded`, ...(filePath !== undefined ? { filePath } : {}) });
+		};
 		const names = this.selectableNames();
 
 		const add = (entry: SelectedExtension): void => {
@@ -196,11 +204,18 @@ export class DiscoveredExtensions {
 					const pkg = this.#packageByNameOrAlias(name);
 					const entry = this.#entries.get(name);
 					if (pkg !== undefined && pkg.name === name) {
-						for (const pkgEntry of this.#packageEntries(pkg)) add(pkgEntry);
+						const pkgEntries = this.#packageEntries(pkg);
+						if (pkgEntries.length === 0) {
+							diagnose(reference, "empty-package", `package "${pkg.name}" declares no extension entries; restore an entry or remove the reference`, pkg.root);
+						}
+						for (const pkgEntry of pkgEntries) add(pkgEntry);
 					}
 					if (entry !== undefined) add(entry);
 				}
-				if (matched === 0) unmatched.push(reference);
+				if (matched === 0) {
+					unmatched.push(reference);
+					diagnose(reference, "zero-match", `"extension:${reference}" matched nothing this resolution`);
+				}
 				continue;
 			}
 
@@ -213,32 +228,31 @@ export class DiscoveredExtensions {
 			if (pkg !== undefined) {
 				const pkgEntries = this.#packageEntries(pkg);
 				if (pkgEntries.length === 0) {
-					throw new ExtensionError(
-						`package "${reference}" declares no extension entries (missing on disk, filtered out by its settings package entry, or shadowed by local files)`,
-					);
+					diagnose(reference, "empty-package", `package "${reference}" declares no extension entries (missing on disk or filtered out by its settings package entry); restore an entry or remove the reference`);
+					continue;
 				}
 				for (const pkgEntry of pkgEntries) add(pkgEntry);
 				continue;
 			}
 			if (looksLikePath(reference)) {
-				if (reference.startsWith("./") || reference.startsWith("../")) {
-					throw new ExtensionError(
-						`extension reference "${reference}" is a relative path; profiles take absolute paths (or ~/...) — catalogs live in both global and project scope, so a relative base would be ambiguous`,
-					);
+				if (!path.isAbsolute(reference) && !reference.startsWith("~/")) {
+					diagnose(reference, "relative-path", `extension reference "${reference}" is a relative path; profiles take absolute paths (or ~/...) — catalogs live in both global and project scope, so a relative base would be ambiguous`);
+					continue;
 				}
 				const resolved = reference.startsWith("~/")
 					? path.join(process.env.HOME ?? "", reference.slice(1))
 					: path.resolve(reference);
 				if (!(await isFile(resolved))) {
-					throw new ExtensionError(`extension path not found: ${resolved}`);
+					diagnose(reference, "missing-path", `extension path not found: ${resolved}; restore the file or remove the reference`, resolved);
+					continue;
 				}
 				add({ id: resolved, entry: resolved, origin: "path" });
 				continue;
 			}
-			throw new ExtensionError(this.#unknownMessage(reference, names));
+			diagnose(reference, "unknown-reference", `${this.#unknownMessage(reference, names)} Install the extension or correct the reference`);
 		}
 
-		return { entries: [...byPath.values()], unmatched };
+		return { entries: [...byPath.values()], unmatched, ...(diagnostics.length > 0 ? { diagnostics } : {}) };
 	}
 }
 

@@ -2,25 +2,34 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as initialProfile from "../src/launcher/initial-profile.ts";
+import * as jsonFile from "../src/json-file.ts";
 import piProfileExtension from "../extensions/pi-profile/index.ts";
 
 let root: string;
 let savedAgentDir: string | undefined;
 let savedSwitchDir: string | undefined;
+let savedHome: string | undefined;
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "pi-profile-ext-"));
 	savedAgentDir = process.env.PI_CODING_AGENT_DIR;
 	savedSwitchDir = process.env.PI_PROFILE_SWITCH_DIR;
+	savedHome = process.env.HOME;
 	process.env.PI_CODING_AGENT_DIR = root;
 	process.env.PI_PROFILE_SWITCH_DIR = root;
+	process.env.HOME = root;
 });
 
 afterEach(async () => {
-	process.env.PI_CODING_AGENT_DIR = savedAgentDir;
-	process.env.PI_PROFILE_SWITCH_DIR = savedSwitchDir;
+	vi.restoreAllMocks();
+	if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+	if (savedSwitchDir === undefined) delete process.env.PI_PROFILE_SWITCH_DIR;
+	else process.env.PI_PROFILE_SWITCH_DIR = savedSwitchDir;
+	if (savedHome === undefined) delete process.env.HOME;
+	else process.env.HOME = savedHome;
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -29,7 +38,7 @@ interface FakePi {
 	commands: Map<string, { description: string; handler: (...args: never[]) => unknown }>;
 	events: { on(event: string, handler: unknown): void; emit(event: string, data: unknown): void };
 	activeTools: string[];
-	sentMessages: Array<{ customType: string; content: unknown; display?: boolean }>;
+	sentMessages: Array<{ customType: string; content: unknown; display?: boolean; details?: unknown }>;
 	on(event: string, handler: (...args: never[]) => unknown): void;
 	registerCommand(name: string, def: { description: string; handler: (...args: never[]) => unknown }): void;
 	getAllTools(): Array<{ name: string }>;
@@ -72,6 +81,10 @@ function fakeCtx(options?: {
 	selectAnswers?: string[];
 	inputAnswers?: Array<string | undefined>;
 	confirmAnswers?: boolean[];
+	/** Model Pi's post-reload context invalidation for `ui` access. */
+	staleUi?: boolean;
+	/** No UI surface at all (non-interactive modes). */
+	uiAbsent?: boolean;
 }) {
 	const notifications: Array<{ message: string; level: string }> = [];
 	const selectCalls: Array<{ title: string; options: string[] }> = [];
@@ -82,6 +95,17 @@ function fakeCtx(options?: {
 	// context — property access afterwards throws (the switch's staleness
 	// probe reads ctx.cwd).
 	let stale = false;
+	const uiSurface = {
+		notify(message: string, level: string) {
+			notifications.push({ message, level });
+		},
+		select: async (title: string, selectOptions: string[]) => {
+			selectCalls.push({ title, options: selectOptions });
+			return selectAnswers.length > 0 ? selectAnswers.shift() : options?.selectAnswer;
+		},
+		input: async () => inputAnswers.shift(),
+		confirm: async () => confirmAnswers.shift() ?? true,
+	};
 	return {
 		notifications,
 		selectCalls,
@@ -96,16 +120,10 @@ function fakeCtx(options?: {
 		reload: async () => {
 			stale = true;
 		},
-		ui: {
-			notify(message: string, level: string) {
-				notifications.push({ message, level });
-			},
-			select: async (title: string, selectOptions: string[]) => {
-				selectCalls.push({ title, options: selectOptions });
-				return selectAnswers.length > 0 ? selectAnswers.shift() : options?.selectAnswer;
-			},
-			input: async () => inputAnswers.shift(),
-			confirm: async () => confirmAnswers.shift() ?? true,
+		get ui(): typeof uiSurface | undefined {
+			if (options?.uiAbsent) return undefined;
+			if (options?.staleUi && stale) throw new Error("context invalidated by reload");
+			return uiSurface;
 		},
 	};
 }
@@ -129,12 +147,35 @@ async function fireSessionStart(pi: FakePi, reason = "startup", ctx?: ReturnType
 }
 
 /** Lets the un-awaited startup-notifier job (fs-bound, no network with a
- *  fresh seeded cache) settle before asserting on recorded notices. */
+ *  fresh seeded cache) surface its notices. The notice is displayed before
+ *  its key is persisted, so the history is a LATER step: never assert on
+ *  `displayed.json` right after this returns, wait for the expected key with
+ *  `waitForDisplayedKey` instead. */
 async function waitForNotices(ctx: ReturnType<typeof fakeCtx>): Promise<void> {
 	const deadline = Date.now() + 2000;
 	while (ctx.notifications.length === 0 && Date.now() < deadline) {
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
+}
+
+/** Waits for the recorded displayed-history to contain `until` and returns
+ *  the keys read. Recording follows display by a few (fs-latency-bound)
+ *  milliseconds; a single read races that write. */
+async function waitForDisplayedKey(until: string): Promise<string[]> {
+	const deadline = Date.now() + 2000;
+	let keys: string[] = [];
+	while (!keys.includes(until) && Date.now() < deadline) {
+		try {
+			const history = JSON.parse(await readFile(path.join(root, "notifications", "displayed.json"), "utf8")) as {
+				keys?: unknown;
+			};
+			keys = Array.isArray(history.keys) ? history.keys.filter((key): key is string => typeof key === "string") : [];
+		} catch {
+			// Not written yet (or observed mid-rename): retry until the deadline.
+		}
+		if (!keys.includes(until)) await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	return keys;
 }
 
 async function runBeforeAgentStart(pi: FakePi, systemPrompt: string): Promise<string | undefined> {
@@ -238,11 +279,9 @@ describe("startup notifications (add-startup-notifications)", () => {
 		expect(text).toContain(upgradeAnnouncement.message);
 		expect(text).not.toContain(`${ownVersion} → ${newerTarget}`);
 		// The suppressed reminder target is NOT recorded as shown…
-		const history = JSON.parse(await readFile(path.join(root, "notifications", "displayed.json"), "utf8")) as {
-			keys: string[];
-		};
-		expect(history.keys).toContain(`announcement:${upgradeAnnouncement.id}`);
-		expect(history.keys).not.toContain(`upgrade:${newerTarget}`);
+		const keys = await waitForDisplayedKey(`announcement:${upgradeAnnouncement.id}`);
+		expect(keys).toContain(`announcement:${upgradeAnnouncement.id}`);
+		expect(keys).not.toContain(`upgrade:${newerTarget}`);
 	});
 
 	it("writes notices to stderr outside TUI modes", async () => {
@@ -423,6 +462,51 @@ describe("pi-profile extension", () => {
 		expect(overlay === undefined || Object.keys(overlay).length === 0).toBe(true);
 	});
 
+	it("delivers an actionable activation failure before the rollback reload invalidates the context", async () => {
+		await writeLaunchPlan({ profile: "default", source: "builtin", agentDir: root });
+		await writeGlobalProfiles({ open: {} });
+		// Real content at the managed extension path blocks the transition.
+		await mkdir(path.join(root, "extensions"), { recursive: true });
+		const pi = fakePi();
+		piProfileExtension(pi as never);
+		const ctx = fakeCtx({ staleUi: true });
+
+		await pi.commands.get("profile")?.handler("use open" as never, ctx as never);
+
+		const failure = ctx.notifications.find(
+			(entry) => entry.level === "error" && entry.message.includes('activation of profile "open" failed'),
+		);
+		expect(failure?.message).toContain(path.join(root, "extensions"));
+		expect(failure?.message).toContain("will not delete or overwrite");
+		// No false activation reporting on failure.
+		expect(ctx.notifications.some((entry) => entry.message.includes("profile active"))).toBe(false);
+	});
+
+	it("falls back to stderr when no UI is available for an activation failure", async () => {
+		await writeLaunchPlan({ profile: "default", source: "builtin", agentDir: root });
+		await writeGlobalProfiles({ open: {} });
+		await mkdir(path.join(root, "extensions"), { recursive: true });
+		const pi = fakePi();
+		piProfileExtension(pi as never);
+		const ctx = fakeCtx({ uiAbsent: true });
+
+		const chunks: string[] = [];
+		const realWrite = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: unknown) => {
+			chunks.push(String(chunk));
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			await pi.commands.get("profile")?.handler("use open" as never, ctx as never);
+		} finally {
+			process.stderr.write = realWrite;
+		}
+
+		const text = chunks.join("");
+		expect(text).toContain('activation of profile "open" failed');
+		expect(text).toContain("will not delete or overwrite");
+	});
+
 	describe("observability surface (ticket 07)", () => {
 		it("/profile status sends the resolved plan report", async () => {
 			await writeLaunchPlan({
@@ -440,7 +524,54 @@ describe("pi-profile extension", () => {
 			const content = String(pi.sentMessages[0]?.content);
 			expect(content).toContain("profile: review (global)");
 			expect(content).toContain("code-review → /x/SKILL.md");
-			expect(content).toContain("mcp: enabled=[github]");
+			expect(content).toContain("mcp: enabled=[] disabled=[] missing=[github]");
+		});
+
+		it("reports declared subagent inputs separately from live extension ownership", async () => {
+			await writeLaunchPlan({
+				profile: "review",
+				source: "global",
+				agentDir: root,
+				resolved: { skills: [], extensions: [] },
+				subagents: { defaultModel: "provider/model", agentOverrides: { reviewer: { description: "Review code" } } },
+			});
+			const pi = fakePi();
+			piProfileExtension(pi as never);
+
+			await pi.commands.get("profile")?.handler("status" as never, fakeCtx() as never);
+
+			const message = pi.sentMessages[0];
+			const report = (message?.details as { report: { subagents?: unknown } }).report;
+			expect(report.subagents).toEqual({
+				declared: { defaultModel: "provider/model", agentOverrides: { reviewer: { description: "Review code" } } },
+				extension: "unconfirmed",
+			});
+			expect(String(message?.content)).toContain("not effective runtime mappings");
+			expect(String(message?.content)).toContain("/subagents-models");
+		});
+
+		it("warns through the mode-safe notice surface only when declarations exist", async () => {
+			await writeLaunchPlan({ profile: "review", source: "global", subagents: { defaultModel: "provider/model" } });
+			const pi = fakePi();
+			piProfileExtension(pi as never);
+			const ctx = fakeCtx({ hasUI: true, mode: "tui" });
+
+			await fireSessionStart(pi, "startup", ctx);
+
+			expect(ctx.notifications.filter((entry) => entry.level === "warning" && entry.message.includes("pi-subagents"))).toHaveLength(1);
+			expect(ctx.notifications.find((entry) => entry.message.includes("pi-subagents"))?.message).toContain("/subagents-models");
+			expect(pi.activeTools).toEqual([]);
+		});
+
+		it("does not add subagent warning on session start without a declaration", async () => {
+			await writeLaunchPlan({ profile: "review", source: "global" });
+			const pi = fakePi();
+			piProfileExtension(pi as never);
+			const ctx = fakeCtx({ hasUI: true, mode: "tui" });
+
+			await fireSessionStart(pi, "startup", ctx);
+
+			expect(ctx.notifications.some((entry) => entry.message.includes("pi-subagents registration"))).toBe(false);
 		});
 
 		it("bare /profile falls back to the list without dialog-capable UI", async () => {
@@ -484,7 +615,7 @@ describe("pi-profile extension", () => {
 		});
 	});
 
-	it("does not register an mcp command (leaves /mcp to pi-mcp-adapter)", async () => {
+	it("does not register an mcp command", async () => {
 		const pi = fakePi();
 		piProfileExtension(pi as never);
 		expect(pi.commands.has("mcp")).toBe(false);
@@ -501,4 +632,286 @@ describe("pi-profile extension", () => {
 			ctx.notifications.some((entry) => entry.level === "error" && entry.message.includes("usage: /profile")),
 		).toBe(true);
 	});
+
+	describe("separate MCP tool filtering", () => {
+		it("session_start retains live MCP tools when tools narrows Pi tools", async () => {
+			await writeLaunchPlan({
+				profile: "narrow",
+				source: "global",
+				agentDir: root,
+				tools: ["read"],
+				toolReferences: ["read"],
+				resolved: {
+					skills: [],
+					extensions: [],
+				},
+			});
+			const pi = fakePi();
+			pi.getAllTools = () => [
+				{ name: "read", sourceInfo: { path: "pi", source: "builtin" } },
+				{ name: "bash", sourceInfo: { path: "pi", source: "builtin" } },
+				{ name: "mcp", sourceInfo: { path: "builtin:mcp", source: "builtin" } },
+				{ name: "fixture_tool", sourceInfo: { path: "builtin:mcp", source: "builtin" } },
+			];
+			piProfileExtension(pi as never);
+
+			await fireSessionStart(pi);
+
+			// read is retained; bash is excluded; MCP tools (mcp, fixture_tool) are preserved
+			expect(pi.activeTools).toContain("read");
+			expect(pi.activeTools).not.toContain("bash");
+			expect(pi.activeTools).toContain("mcp");
+			expect(pi.activeTools).toContain("fixture_tool");
+		});
+
+		it("session_start does not retain a tool from a sibling extension as MCP-owned", async () => {
+			await writeLaunchPlan({
+				profile: "no-pi-tools",
+				source: "global",
+				agentDir: root,
+				tools: [],
+				toolReferences: [],
+				resolved: {
+					skills: [],
+					extensions: [
+						{ id: "mcp-helper", entry: "/agent/extensions/mcp-helper.ts" },
+						{ id: "linter", entry: "/agent/extensions/linter.ts" },
+					],
+				},
+			});
+			const pi = fakePi();
+			pi.getAllTools = () => [
+				{ name: "mcp", sourceInfo: { path: "builtin:mcp", source: "builtin" } },
+				{ name: "helper_tool", sourceInfo: { path: "/agent/extensions/mcp-helper.ts", source: "extension" } },
+				{ name: "lint_check", sourceInfo: { path: "/agent/extensions/linter.ts", source: "extension" } },
+			];
+			piProfileExtension(pi as never);
+
+			const ctx = fakeCtx();
+			await fireSessionStart(pi, "startup", ctx);
+
+			expect(pi.activeTools).toEqual(["mcp"]);
+			expect(ctx.notifications.some((entry) => /lint_check.*mcp_tools/.test(entry.message))).toBe(false);
+		});
+
+		it("session_start retains native MCP discovery entry points when the plan marks gateways", async () => {
+			await writeLaunchPlan({
+				profile: "narrow",
+				source: "global",
+				agentDir: root,
+				tools: ["read"],
+				toolReferences: ["read"],
+				mcpGateways: true,
+				resolved: { skills: [], extensions: [] },
+			});
+			const pi = fakePi();
+			pi.getAllTools = () => [
+				{ name: "read", sourceInfo: { path: "pi", source: "builtin" } },
+				{ name: "bash", sourceInfo: { path: "pi", source: "builtin" } },
+				{ name: "codemode", sourceInfo: { path: "builtin:codemode", source: "builtin" } },
+				{ name: "tool_search", sourceInfo: { path: "builtin:tool-search", source: "builtin" } },
+				{ name: "fixture_tool", sourceInfo: { path: "/agent/extensions/fixture.ts", source: "extension" } },
+			];
+			piProfileExtension(pi as never);
+			const ctx = fakeCtx();
+
+			await fireSessionStart(pi, "startup", ctx);
+
+			expect(pi.activeTools).toContain("read");
+			expect(pi.activeTools).toContain("codemode");
+			expect(pi.activeTools).toContain("tool_search");
+			expect(pi.activeTools).not.toContain("bash");
+			expect(pi.activeTools).not.toContain("fixture_tool");
+		});
+
+		it("session_start does not use a same-named foreign tool as an MCP gateway", async () => {
+			await writeLaunchPlan({
+				profile: "narrow",
+				source: "global",
+				agentDir: root,
+				tools: ["read"],
+				toolReferences: ["read"],
+				mcpGateways: true,
+				resolved: { skills: [], extensions: [] },
+			});
+			const pi = fakePi();
+			pi.getAllTools = () => [
+				{ name: "read", sourceInfo: { path: "pi", source: "builtin" } },
+				{ name: "codemode", sourceInfo: { path: "/agent/extensions/other.ts", source: "extension" } },
+				{ name: "tool_search", sourceInfo: { path: "builtin:tool-search", source: "builtin" } },
+			];
+			piProfileExtension(pi as never);
+			const ctx = fakeCtx();
+
+			await fireSessionStart(pi, "startup", ctx);
+
+			expect(pi.activeTools).toContain("read");
+			expect(pi.activeTools).toContain("tool_search");
+			expect(pi.activeTools).not.toContain("codemode");
+			expect(
+				ctx.notifications.some(
+					(entry) =>
+						entry.level === "warning" &&
+						entry.message.includes('MCP entry point "codemode" is registered by /agent/extensions/other.ts'),
+				),
+			).toBe(true);
+		});
+
+		it("session_start warns about legacy MCP references in tools", async () => {
+			await writeLaunchPlan({
+				profile: "legacy",
+				source: "global",
+				agentDir: root,
+				tools: ["read", "mcp__*"],
+				toolReferences: ["read", "mcp__*"],
+				resolved: {
+					skills: [],
+					extensions: [],
+				},
+			});
+			const pi = fakePi();
+			pi.getAllTools = () => [
+				{ name: "read", sourceInfo: { path: "pi", source: "builtin" } },
+				{ name: "mcp__query", sourceInfo: { path: "builtin:mcp", source: "builtin" } },
+			];
+			piProfileExtension(pi as never);
+			const ctx = fakeCtx();
+
+			await fireSessionStart(pi, "startup", ctx);
+
+			expect(
+				ctx.notifications.some(
+					(n) => n.level === "warning" && n.message.includes('tool reference "mcp__*" matched only MCP tools') && n.message.includes("mcp_tools"),
+				),
+			).toBe(true);
+		});
+
+		it("keeps configured MCP names restrictive without warning or validation status", async () => {
+			await writeFile(
+				path.join(root, "mcp.json"),
+				JSON.stringify({ mcpServers: { github: {}, linear: { enabled: false } } }),
+			);
+			await writeLaunchPlan({
+				profile: "restricted",
+				source: "global",
+				agentDir: root,
+				mcpTools: { github: ["serach"] },
+			});
+			const pi = fakePi();
+			piProfileExtension(pi as never);
+			const ctx = fakeCtx();
+
+			await fireSessionStart(pi, "startup", ctx);
+			expect(ctx.notifications.some((entry) => /MCP server.*tool.*not found/i.test(entry.message))).toBe(false);
+
+			await pi.commands.get("profile")?.handler("status" as never, fakeCtx() as never);
+			const report = (pi.sentMessages.at(-1)?.details as { report: any }).report;
+			expect(report.mcp).toEqual({ enabled: ["github"], disabled: ["linear"], missing: [] });
+			expect(report.mcpTools).toEqual([{ server: "github", policy: "restricted", tools: ["serach"] }]);
+			expect(JSON.stringify(report)).not.toMatch(/validation|missing.*candidates|did you mean/i);
+		});
+	});
+});
+
+
+describe("unavailable listing and diagnostic status", () => {
+	it("lists unavailable definitions and filename diagnostics in displayed and structured payloads", async () => {
+		await writeLaunchPlan({ profile: "default", source: "builtin", agentDir: root });
+		await writeGlobalProfiles({ bad: { skills: 1 }, valid: {}, default: {}, "bad name": {} });
+		const pi = fakePi(); piProfileExtension(pi as never);
+		await pi.commands.get("profile")?.handler("" as never, fakeCtx() as never);
+		const message = pi.sentMessages[0]!;
+		expect(String(message.content)).toContain("bad [global] — unavailable:");
+		expect(String(message.content)).toContain("bad name.json");
+		const details = message.details as { profiles: Array<{ name: string; available: boolean; error?: string }>; diagnostics: string[] };
+		expect(details.profiles.find((entry) => entry.name === "bad")).toMatchObject({ available: false, error: expect.stringContaining("bad.json") });
+		expect(details.diagnostics.join("\n")).toContain("default.json");
+	});
+	it("offers only available choices, shows unavailable errors, and rejects a forged unavailable choice", async () => {
+		await writeLaunchPlan({ profile: "default", source: "builtin", agentDir: root });
+		await writeGlobalProfiles({ bad: { skills: 1 }, valid: {} });
+		const before = await readFile(path.join(root, "pi-profile.json"), "utf8");
+		const pi = fakePi(); piProfileExtension(pi as never);
+		const ctx = fakeCtx({ hasUI: true, selectAnswer: "bad [global]" });
+		await pi.commands.get("profile")?.handler("" as never, ctx as never);
+		expect(ctx.selectCalls[0]?.options).toEqual(["default [builtin]", "valid [global]"]);
+		expect(ctx.notifications.some((entry) => entry.message.includes("bad.json"))).toBe(true);
+		expect(await readFile(path.join(root, "pi-profile.json"), "utf8")).toBe(before);
+	});
+	it("explicit use still reports the unavailable selected-definition error without writes", async () => {
+		await writeLaunchPlan({ profile: "default", source: "builtin", agentDir: root });
+		await writeGlobalProfiles({ bad: { skills: 1 } });
+		const pi = fakePi(); piProfileExtension(pi as never); const ctx = fakeCtx();
+		await pi.commands.get("profile")?.handler("use bad" as never, ctx as never);
+		expect(ctx.notifications.some((entry) => entry.level === "error" && entry.message.includes("bad.json"))).toBe(true);
+		expect(JSON.parse(await readFile(path.join(root, "pi-profile.json"), "utf8")).profile).toBe("default");
+	});
+	it("status never reads catalog definitions and stays available with a bad catalog path", async () => {
+		await writeLaunchPlan({ profile: "review", source: "global", agentDir: root, mcps: [], diagnostics: [{ kind: "skill", code: "unknown-reference", reference: "missing", message: "missing skill; not loaded" }] });
+		await writeFile(path.join(root, "profiles"), "not a directory");
+		await writeFile(path.join(root, "mcp.json"), "{ malformed");
+		const pi = fakePi(); piProfileExtension(pi as never); const ctx = fakeCtx();
+		const read = vi.spyOn(jsonFile, "readJsonFile");
+		await pi.commands.get("profile")?.handler("status" as never, ctx as never);
+		expect(pi.sentMessages).toHaveLength(1);
+		const report = (pi.sentMessages[0]?.details as { report: { diagnostics: Array<{ kind: string }> } }).report;
+		expect(report.diagnostics.some((issue) => issue.kind === "skill")).toBe(true);
+		expect(report.diagnostics.some((issue) => issue.kind === "mcp-source")).toBe(true);
+		expect(read.mock.calls.map(([file]) => file).some((file) => file.includes(`${path.sep}profiles${path.sep}`))).toBe(false);
+	});
+	it("reload owns persisted warnings once while non-persisted warnings remain observable after a stale context", async () => {
+		const issue = { kind: "extension-discovery", code: "discovery-warning", reference: "collision", message: 'profile "review": collision; local file wins' };
+		await writeLaunchPlan({ profile: "default", source: "builtin", agentDir: root });
+		vi.spyOn(initialProfile, "resolveInitialProfile").mockResolvedValue({ plan: { profile: "review", source: "global", filter: "selection", skills: [], extensions: [], resourceSelection: { skills: true, extensions: true }, diagnostics: [issue] }, projectTrusted: true, warnings: [issue.message, "non-persisted warning"] });
+		const pi = fakePi(); piProfileExtension(pi as never);
+		const next = fakeCtx({ hasUI: true });
+		const previous = fakeCtx({ hasUI: true });
+		const ui = previous.ui;
+		const invalidate = previous.reload;
+		previous.reload = async () => { await fireSessionStart(pi, "reload", next); await invalidate(); };
+		Object.defineProperty(previous, "ui", { get() { void previous.cwd; return ui; } });
+		await pi.commands.get("profile")?.handler("use review" as never, previous as never);
+		const notices = [...previous.notifications, ...next.notifications];
+		expect(notices.filter((entry) => entry.message === issue.message)).toHaveLength(1);
+		expect(notices.filter((entry) => entry.message === "non-persisted warning")).toHaveLength(1);
+		expect(notices.some((entry) => entry.message.includes("context invalidated"))).toBe(false);
+	});
+});
+
+
+describe("command feedback after diagnostic message refresh", () => {
+	it.each([false, true])("does not replay replaced/cleared diagnostics (cleared=%s) and retains plain warnings", async (cleared) => {
+		await writeLaunchPlan({ profile: "default", source: "builtin", agentDir: root });
+		await writeGlobalProfiles({ policy: { mcp_tools: { late: ["search"] } } });
+		await writeFile(path.join(root, "mcp.json"), '{"mcpServers":{"alpha":{"command":"alpha"}}}');
+		const resolve = initialProfile.resolveInitialProfile;
+		vi.spyOn(initialProfile, "resolveInitialProfile").mockImplementation(async (...args) => {
+			const result = await resolve(...args);
+			await writeFile(path.join(root, "mcp.json"), JSON.stringify({ mcpServers: cleared ? { late: { command: "late" } } : { beta: { command: "beta" } } }));
+			return { ...result, warnings: [...result.warnings, "plain discovery warning"] };
+		});
+		const pi = fakePi(); piProfileExtension(pi as never);
+		const next = fakeCtx({ hasUI: true }); const previous = fakeCtx({ hasUI: true });
+		const invalidate = previous.reload;
+		previous.reload = async () => { await fireSessionStart(pi, "reload", next); await invalidate(); };
+		await pi.commands.get("profile")?.handler("use policy" as never, previous as never);
+		const warnings = [...previous.notifications, ...next.notifications].filter((entry) => entry.level === "warning").map((entry) => entry.message);
+		expect(warnings.filter((message) => message === "plain discovery warning")).toHaveLength(1);
+		expect(warnings.some((message) => message.includes("candidates: alpha"))).toBe(false);
+		const issues = warnings.filter((message) => message.includes('unknown MCP server "late"'));
+		expect(issues).toHaveLength(cleared ? 0 : 1);
+		if (!cleared) expect(issues[0]).toContain("candidates: beta");
+	});
+});
+
+it("preserves legacy plain command warnings when the persisted plan has no diagnostics", async () => {
+	await writeLaunchPlan({ profile: "default", source: "builtin", agentDir: root });
+	vi.spyOn(initialProfile, "resolveInitialProfile").mockResolvedValue({ plan: { profile: "legacy", source: "global", filter: "selection", skills: [], extensions: [], resourceSelection: { skills: true, extensions: true } }, projectTrusted: true, warnings: ["legacy plain warning"] });
+	const pi = fakePi(); piProfileExtension(pi as never);
+	const previous = fakeCtx({ hasUI: true }); const next = fakeCtx({ hasUI: true });
+	const invalidate = previous.reload;
+	previous.reload = async () => { await fireSessionStart(pi, "reload", next); await invalidate(); };
+	await pi.commands.get("profile")?.handler("use legacy" as never, previous as never);
+	expect([...previous.notifications, ...next.notifications].filter((entry) => entry.message === "legacy plain warning")).toHaveLength(1);
+	expect(JSON.parse(await readFile(path.join(root, "pi-profile.json"), "utf8")).diagnostics).toBeUndefined();
 });

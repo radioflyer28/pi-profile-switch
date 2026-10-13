@@ -38,7 +38,21 @@
       "items": {
         "type": "string"
       },
-      "description": "Tool names or globs expanded against Pi's live registry (including extension tools)."
+      "description": "Names or globs for non-MCP Pi built-ins and non-MCP extension tools; MCP tools are selected separately with mcp_tools."
+    },
+    "mcp_tools": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[^[*?\\]{}]+$"
+      },
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "pattern": "^[^[*?\\]{}]+$"
+        }
+      },
+      "description": "Per-server tool lists mapping literal MCP server names to arrays of literal pi-mcp-adapter tool selectors. Original and prefixed names can select the same tool; globs are not allowed. An omitted server allows all its tools; an empty list denies all its tools."
     },
     "defaultProvider": {
       "type": "string",
@@ -56,30 +70,75 @@
       "type": "string",
       "description": "Appended to Pi's fully built system prompt on every turn."
     },
-    "child": {
+    "subagents": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["isolation", "context"],
-      "description": "Strict replace-mode child launch policy. Child resolution additionally requires explicit tools, skills, and extensions arrays.",
       "properties": {
-        "isolation": {
-          "type": "string",
-          "enum": ["process", "session"]
-        },
-        "context": {
+        "defaultModel": { "type": "string", "pattern": "\\S" },
+        "defaultThinking": { "$ref": "#/$defs/thinkingLevel" },
+        "agentOverrides": {
           "type": "object",
-          "additionalProperties": false,
-          "required": ["project", "global", "projectResources"],
-          "properties": {
-            "project": { "type": "boolean" },
-            "global": { "type": "boolean" },
-            "projectResources": {
-              "type": "string",
-              "enum": ["deny", "allow"]
+          "propertyNames": { "pattern": "^(?!\\s)(?!.*\\s$)(?!.*[*?\\[\\]{}]).+$" },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "model": { "anyOf": [{ "type": "string", "pattern": "\\S" }, { "const": false }] },
+              "thinking": { "anyOf": [{ "$ref": "#/$defs/thinkingLevel" }, { "const": false }] },
+              "description": { "type": "string", "pattern": "\\S" },
+              "advertise": { "type": "boolean" }
             }
           }
         }
       }
+    },
+    "child": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "isolation",
+        "context"
+      ],
+      "description": "Strict replace-mode child launch policy. Child resolution additionally requires explicit tools, skills, and extensions arrays.",
+      "properties": {
+        "isolation": {
+          "type": "string",
+          "enum": [
+            "process",
+            "session"
+          ]
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "project",
+            "global",
+            "projectResources"
+          ],
+          "properties": {
+            "project": {
+              "type": "boolean"
+            },
+            "global": {
+              "type": "boolean"
+            },
+            "projectResources": {
+              "type": "string",
+              "enum": [
+                "deny",
+                "allow"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "thinkingLevel": {
+      "type": "string",
+      "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
     }
   }
 }

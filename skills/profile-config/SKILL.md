@@ -44,6 +44,8 @@ Profile files live in one of two locations:
 
 The file content must be formatted JSON, with **the bare definition object at the top level** — strictly no `schemaVersion`, `profiles`, or other outer envelope fields.
 
+Use the authoritative [profile schema](../../schemas/profiles.schema.json) for supported fields and shapes, and the [field contract](../../openspec/specs/profile-catalog/spec.md#requirement-profile-definition-fields) for read/write diagnostics. When working from an installed copy of this skill, locate `schemas/profiles.schema.json` in the installed `pi-profile-switch` package before validating edits.
+
 All fields are optional. Undeclared fields keep native Pi behavior or current state and produce no side effects.
 
 ### Field semantics
@@ -54,12 +56,21 @@ All fields are optional. Undeclared fields keep native Pi behavior or current st
 | `description` | `string` | Short description of the profile (e.g. `"Read-only review profile"`). |
 | `skills` | `string[]` | Skill names or globs to reference. When undeclared, available skills are not narrowed. |
 | `extensions` | `string[]` | Extension identifiers or globs to reference. When undeclared, available extensions are not narrowed. |
-| `mcps` | `string[]` | MCP server names or globs to reference. When undeclared, there is no dependency on `pi-mcp-adapter`. |
-| `tools` | `string[]` | Whitelisted tool names or globs. When undeclared, tools are not narrowed and Pi's native tool set is kept. |
+| `mcps` | `string[]` | MCP server names or globs to reference. When undeclared, all discovered user-level servers keep their normal availability. An explicit `mcps: []` disables every discovered user-level server. Project-level servers are never narrowed. |
+| `tools` | `string[]` | Whitelisted non-MCP tool names or globs (built-in and extension tools only). Live MCP tools remain usable independently of `tools`. When undeclared, tools are not narrowed and Pi's native tool set is kept. |
+| `mcp_tools` | `Record<string, string[]>` | Per-server MCP tool selection: literal server names mapped to literal MCP tool names as exposed by Pi's built-in MCP extension. Globs are rejected. An omitted server allows all tools; a nonempty array allows only matches; an empty array (`[]`) denies all tools while keeping the server enabled. An empty object (`{}`) behaves like omission. |
 | `defaultProvider` | `string` | Default model provider (e.g. `"anthropic"`, `"openai"`). Effective only when declared together with `defaultModel`. |
 | `defaultModel` | `string` | Default model name (e.g. `"claude-sonnet-4-5"`). Effective only when declared together with `defaultProvider`. |
-| `defaultThinkingLevel` | `string` | Default thinking level; allowed values: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Effective only when the model declaration holds. |
+| `defaultThinkingLevel` | `string` | Parent thinking contribution; accepted values defer to Pi's authoritative thinking-level contract. See [profile-level settings](../../openspec/specs/resource-reference/spec.md#requirement-resolution-and-validation-of-profile-level-settings-fields). |
 | `instructions` | `string` | Instruction text appended to the system prompt when this profile is active. |
+| `subagents` | `object` | Optional native pi-subagents defaults and exact role overrides. Use only the subset in the [profile schema](../../schemas/profiles.schema.json). It neither loads pi-subagents nor selects or disables roles. |
+
+### Validation workflow
+
+- **Fatal shapes**: validate the selected file's JSON object and supported-field types before writing. Follow [selected-definition validation](../../openspec/specs/profile-catalog/spec.md#requirement-catalog-file-format-validation); remove unsupported keys according to the field contract above.
+- **Reference warnings**: inspect discovery and `/profile status`, then correct names or install resources. Preserve explicit empty selections and dormant MCP policies rather than replacing them with omission. Follow [reference failure tiering](../../openspec/specs/resource-reference/spec.md#requirement-unified-failure-tiering-for-references).
+- **Native model handoff**: use native Pi to check models after extension loading; do not add a separate existence or credential preflight. Follow [native model declaration handoff](../../openspec/specs/launcher/spec.md#requirement-native-model-declaration-handoff).
+- After activation or reload, review [listing and status diagnostics](../../openspec/specs/in-session-switch/spec.md#requirement-observability-surface). Resource overlay mutations retain their [separate validation contract](../../openspec/specs/in-session-switch/spec.md#requirement-runtime-overlay).
 
 ### Example
 ```json
@@ -69,7 +80,6 @@ All fields are optional. Undeclared fields keep native Pi behavior or current st
   "skills": [
     "profile-config"
   ],
-  "extensions": [],
   "mcps": [],
   "tools": [
     "read",
@@ -80,11 +90,24 @@ All fields are optional. Undeclared fields keep native Pi behavior or current st
   "defaultProvider": "anthropic",
   "defaultModel": "claude-sonnet-4-5",
   "defaultThinkingLevel": "high",
-  "instructions": "Focus on code quality, security, and edge cases. Do not edit files."
+  "instructions": "Focus on code quality, security, and edge cases. Do not edit files.",
+  "subagents": {
+    "defaultModel": "anthropic/claude-sonnet-4-5",
+    "agentOverrides": {
+      "reviewer": {
+        "model": "inherit",
+        "thinking": "high",
+        "description": "Independent review of this project",
+        "advertise": true
+      }
+    }
+  }
 }
 ```
 
 ---
+
+A role `description` is metadata and does not replace its system prompt. `advertise: true` lists a role in the parent prompt; `false` only omits that listing and does not disable the role. Role keys are exact names, not an availability list. Profile declarations can be superseded by pi-subagents' native project/provider/per-run precedence, so use `/profile status` for declared inputs and `/subagents-models` for live mappings. See the [launcher contract](../../openspec/specs/launcher/spec.md) and [native model reference](https://github.com/nicobailon/pi-subagents/blob/main/docs/models.md).
 
 ## 3. Discovering referenceable resources
 
@@ -103,14 +126,22 @@ When helping the user configure a profile, check or consult the following locati
      - Absolute paths or `~/` paths.
      - Glob matching.
 3. **MCP servers**:
-   - Discovery locations: the standard configuration locations recognized by `pi-mcp-adapter` — on the global side `~/.config/mcp/mcp.json`, `~/.agents/mcp.json`, `~/.agents/mcp/mcp.json`, `<agentDir>/mcp.json`; trusted projects additionally have `<projectDir>/.mcp.json` and `<projectDir>/.pi/mcp.json`.
+   - Discovery locations: Pi's user-level MCP configuration files — on the global side `~/.config/mcp/mcp.json`, `~/.agents/mcp.json`, `~/.agents/mcp/mcp.json`, `<agentDir>/mcp.json`; trusted projects additionally have `<projectDir>/.pi/mcp.json`.
    - Reference identity: the server key names under the `mcpServers` object in those configuration files.
-   - A profile declaring `mcps` must also ensure the `pi-mcp-adapter` extension is available.
+   - Use Pi to check connection usability; follow the [MCP reference contract](../../openspec/specs/resource-reference/spec.md#requirement-mcp-server-reference-resolution) for skipped sources, server diagnostics, and transport ownership.
 4. **Tools**:
-   - Reference identity: tool names in Pi's live tool registry.
-   - Includes built-in tools (`read`, `write`, `edit`, `bash`, etc.), extension-contributed tools, and tools exposed by MCP servers (the proxy tool `mcp__<server>` and direct tools `<server>_<tool>`).
-   - Globs supported (e.g. `"mcp__*"`, `"github_*"`).
-5. **Narrowing boundary of project-level resources (important)**:
+   - Reference identity: non-MCP tool names in Pi's live tool registry.
+   - Includes built-in tools (`read`, `write`, `edit`, `bash`, etc.) and extension-contributed tools.
+   - MCP-owned tools are **not** controlled by `tools`; legacy references such as `"mcp__*"` or `"github_*"` in `tools` must be migrated to `mcp_tools`.
+5. **MCP Tools (`mcp_tools`)**:
+   - Reference identity: keys are literal configured MCP server names; values are literal MCP tool names as exposed by Pi's built-in MCP extension. Globs are not accepted.
+   - Selectors are not checked against a live tool catalog. A selector matching no tool stays restrictive and produces no name diagnostic; verify selector forms with the MCP server before writing the profile.
+   - Prefixed selectors from previous MCP integrations (e.g. `<server>_<tool>`) no longer apply; replace them with the literal tool names from Pi's built-in MCP extension.
+   - Omitting a server key preserves unrestricted access to that server's tools.
+   - An empty list (`[]`) denies all tools for that server while keeping the server enabled.
+   - A nonempty list (e.g. `["search", "get_issue"]`) allows only those tools across direct tools, gateway proxies, and scripts.
+   - Narrowing applies only to user-level MCP servers; project-level MCP servers cannot be narrowed by profiles.
+6. **Narrowing boundary of project-level resources (important)**:
    - A profile's resource selection (`skills`, `extensions`) **applies only to user-level resources** (the real agentDir and `~/.agents/skills`).
    - The visibility of project-level resources (project `.pi/skills`, project `.pi/extensions`, ancestor `.agents/skills`) is decided by Pi's project-trust determination: in a trusted project they are always visible under **any** profile; in an untrusted project they are never visible.
    - Therefore project-level resource visibility **does not narrow with profiles** — there is no need, and no guidance, to declare project-level resources in a profile.
@@ -147,7 +178,7 @@ When creating or generating a new profile that declares `skills` for the user, f
 ### 5.2 Edit
 1. Read the existing content of the target profile file.
 2. Adjust the requested fields per the user's requirements, keeping all other fields intact.
-3. Validate and write back formatted JSON.
+3. Apply the validation workflow above and write back only supported fields as formatted JSON.
 4. Tell the user to run `/profile reload`.
 
 ### 5.3 Delete

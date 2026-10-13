@@ -1,5 +1,6 @@
 import { mkdir, readFile, readlink, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { expectSharedRuntimeFile } from "./helpers/runtime-file-assertions.ts";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -145,11 +146,10 @@ describe("launcher integration: project scope and trust", () => {
 			// resource, filtered like any other).
 			expect(generated.skills).toEqual([
 				`-${path.join(runtimeDir, "skills", "profile-config", "SKILL.md")}`,
+				`-${path.join(fixture.agentDir, "skills", "profile-config", "SKILL.md")}`,
 			]);
 			// Pi reads its project-scope decision from the linked store.
-			expect(await readlink(path.join(runtimeDir, "trust.json"))).toBe(
-				path.join(fixture.agentDir, "trust.json"),
-			);
+			await expectSharedRuntimeFile(path.join(runtimeDir, "trust.json"), path.join(fixture.agentDir, "trust.json"));
 		},
 	);
 

@@ -1,3 +1,5 @@
+**Superseded by ADR-0018.**
+
 # Failure tiering for reference resolution
 
 ## Context

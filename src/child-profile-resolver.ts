@@ -9,7 +9,7 @@ import { ActivationError, BUILTIN_TOOL_NAMES, resolveProfile } from "./profile-r
 import { getGlobalProfilesDir } from "./workspace.ts";
 
 export const CHILD_PROFILE_CONTRACT_VERSION = 1 as const;
-export const PI_PROFILE_SWITCH_PROTOTYPE_VERSION = "0.9.2";
+export const PI_PROFILE_SWITCH_PROTOTYPE_VERSION = "0.16.0";
 
 type Sha256 = `sha256:${string}`;
 
@@ -123,9 +123,10 @@ export async function resolveNamedChildProfile(options: ResolveNamedChildProfile
 		: await ProfileCatalog.load(options.agentDir, {
 			...(projectProfilesAllowed ? { projectDir: options.cwd } : {}),
 		});
-	const profile = catalog.resolve(options.name);
+	const profile = await catalog.resolve(options.name);
 	if (!profile) throw new ActivationError(`unknown child profile: "${options.name}"`);
 	if (profile.source === "builtin") throw new ActivationError('the built-in "default" profile is not an exact child profile');
+	if (profile.warnings?.length) throw new ActivationError(`profile "${profile.name}": ${profile.warnings.join("; ")}`);
 	const definition = profile.definition;
 	if (!definition.child) throw new ActivationError(`profile "${profile.name}" is not child-launch capable: missing "child"`);
 	for (const field of ["tools", "skills", "extensions"] as const) {
@@ -133,8 +134,8 @@ export async function resolveNamedChildProfile(options: ResolveNamedChildProfile
 			throw new ActivationError(`profile "${profile.name}" must explicitly declare "${field}" for child replace mode; use [] for none`);
 		}
 	}
-	if (definition.mcps !== undefined) {
-		throw new ActivationError(`profile "${profile.name}" declares "mcps", which the child profile prototype does not support`);
+	for (const field of ["mcps", "mcp_tools", "subagents"] as const) {
+		if (definition[field] !== undefined) throw new ActivationError(`profile "${profile.name}" declares "${field}", which the child profile prototype does not support`);
 	}
 	if (definition.child.context.projectResources === "allow" && options.projectTrusted !== true) {
 		throw new ActivationError(`profile "${profile.name}" allows project resources but the caller did not establish project trust`);
@@ -150,10 +151,17 @@ export async function resolveNamedChildProfile(options: ResolveNamedChildProfile
 		profile,
 		skills: discovery.skills,
 		extensions: discovery.extensions,
-		...(definition.defaultProvider !== undefined ? { validateModel: options.validateModel } : {}),
 	});
 	if (plan.unmatched?.length) {
 		throw new ActivationError(`profile "${profile.name}" has unmatched child resource reference(s): ${plan.unmatched.join(", ")}`);
+	}
+	// Parent activation may be tolerant; an exact child snapshot must not omit
+	// requested resources or silently discard invalid model declarations.
+	if (plan.diagnostics?.length) throw new ActivationError(plan.diagnostics.map((issue) => issue.message).join("; "));
+	if (plan.model) {
+		if (!options.validateModel) throw new ActivationError(`profile "${profile.name}" declares a model but no model validator is available`);
+		const error = await options.validateModel(plan.model);
+		if (error !== undefined) throw new ActivationError(`profile "${profile.name}": model ${plan.model.provider}/${plan.model.id}: ${error}`);
 	}
 	for (const reference of definition.tools ?? []) {
 		if ((reference.includes("*") || reference.includes("?")) && !(plan.tools ?? []).some((tool) => tool !== reference)) {

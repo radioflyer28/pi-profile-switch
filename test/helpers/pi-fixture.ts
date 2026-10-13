@@ -1,6 +1,13 @@
 import { mkdtemp, mkdir, readdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { afterEach } from "vitest";
+
+const originalUserProfile = process.env.USERPROFILE;
+afterEach(() => {
+	if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+	else process.env.USERPROFILE = originalUserProfile;
+});
 
 /**
  * Fixture layout convention for pi-profile tests (established by ticket 01):
@@ -20,7 +27,13 @@ export interface PiFixture {
 }
 
 export async function createPiFixture(): Promise<PiFixture> {
-	const rawRoot = await mkdtemp(path.join(tmpdir(), "pi-profile-"));
+	// Native Pi scans .agents/skills in ancestors up to the filesystem root.
+	// Windows USERPROFILE/TEMP nesting would expose the operator's real skills
+	// despite HOME overrides. Use a neutral, writable fixture parent on Windows.
+	const base = process.env.PI_PROFILE_TEST_TMPDIR ?? (process.platform === "win32" && process.env.PUBLIC
+		? path.join(process.env.PUBLIC, "pi-profile-test-temp") : tmpdir());
+	await mkdir(base, { recursive: true });
+	const rawRoot = await mkdtemp(path.join(base, "pi-profile-"));
 	const root = await realpath(rawRoot);
 	const cwd = path.join(root, "project");
 	const agentDir = path.join(root, "agent");
@@ -31,6 +44,8 @@ export async function createPiFixture(): Promise<PiFixture> {
 	
 	// Set the environment variable so all code picks up the test workspace.
 	process.env.PI_PROFILE_SWITCH_DIR = profileSwitchDir;
+	// Node's Windows homedir() uses USERPROFILE, not HOME.
+	process.env.USERPROFILE = root;
 
 	return { root, cwd, agentDir, profileSwitchDir };
 }

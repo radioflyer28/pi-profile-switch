@@ -32,16 +32,20 @@ A profile takes over exactly four resource categories (skills, extensions, MCP s
 
 | Scope | Pi mechanism | Form |
 | --- | --- | --- |
-| agentDir level (`skills`, `extensions`) | The discovery root moves with `PI_CODING_AGENT_DIR`, so these are naturally not discovered; settings arrays carry the absolute paths of selected entries | Whitelist (attached paths) |
+| agentDir level (`skills`, `extensions`) | `skills` is mirrored into the instance, so unselected skills are force-excluded by their runtime mirror path. For an omitted extension selection, `extensions` is a conditional managed symlink to the real directory, so Pi auto-discovers it; a declared selection has no link. Settings arrays carry the absolute paths of selected entries, followed by the user's own `!pattern`/`+path`/`-path` entries (absolute agentDir controls rewritten to the runtime mirror path) | Declared kind: whitelist (attached paths) plus exclusion. Omitted kind: native settings plus the overlay's concrete exclusions; the conditional extension mirror exposes the real directory |
 | `~/.agents/skills` (HOME level, cannot be suppressed) | Always auto-discovered, so the settings array carries `-<absolute path>` to force-exclude unselected entries | Complement exclusion |
 | Project level (`.pi/skills`, `.pi/extensions`, ancestor `.agents/skills`) | Owned by Pi: the instance's `trust.json` entry shares the real trust store (or is reconciled there after first creation on Windows), and Pi auto-discovers per stored decisions. A named profile's generated settings still set `defaultProjectTrust: "never"`, but that only suppresses the trust prompt (stored decisions take precedence over it). The narrowing contract is in `openspec/specs/resource-reference/spec.md`, "Narrowing boundary of project-level resources" | Not narrowed by profiles |
-| packages (user-configured packages) | The settings `packages` array is rewritten in object form with per-type allowlist globs | Whitelist |
+| packages (user-configured packages) | The settings `packages` array is rewritten in object form with per-type allowlist globs | Declared kind: whitelist. Omitted kind: the native filter or its absence is preserved, with the overlay's package-relative exclusions appended |
 | packages (project) | Read natively by Pi from the project `.pi/settings.json` and installed under the project `.pi/npm`; generated settings do not merge project settings, so they never become an install side effect of the global npm root | Native |
-| tools | Settings `defaultTools` as the built-in tool boot baseline; after `session_start` and reload, the extension expands the tool references from `pi-profile.json` against Pi's live registry, subtracts the overlay's disabled tool entries, and calls `setActiveTools` | Whitelist |
-| MCP servers | The instance's `mcp.json` keeps only the allowed servers and explicitly marks unselected user-level shared servers as disabled; servers from project `.mcp.json` / `.pi/mcp.json` are not narrowed by profiles. When `mcps` is undeclared, the real `mcp.json` is shared through the platform mirror | Whitelist (file filtering) |
+| tools | Settings `defaultTools` is the built-in boot baseline; after `session_start` and reload, the extension classifies tools by the winning registration's `sourceInfo` and the `builtin:mcp` path, expands only non-MCP references, subtracts overlay disables, and calls `setActiveTools`. `builtin:mcp`-owned registrations remain independent of `tools`. When a profile declares `tools` and the effective MCP set has an enabled server, the generated `defaultTools` baseline and the launch plan marker keep Pi's native MCP discovery entry points (`codemode`, `tool_search`) active; only the built-in registrations count, and an overlay disable still wins | Whitelist |
+| MCP servers & tools | The instance's `mcp.json` is a generated snapshot of the merged user-level configuration: each later user-level source replaces a same-named server in full (no field-wise merge); selected servers keep their winning definitions, unselected user-level servers keep their full winning definition plus `enabled: false`, and an explicit `mcps: []` disables every discovered user-level server while trusted project-level servers stay enabled and are never marked disabled. For eligible enabled user-level definitions, `mcp_tools` replaces the server's merged `toolExposure` with `{"*": "hidden", <selector>: "direct", ...}`; an empty list becomes `{"*": "hidden"}`. Source files are never modified. Selector matching and failure conditions are defined by the [resource-reference contract](../../openspec/specs/resource-reference/spec.md). | Whitelist (file filtering) |
 | prompts, themes (not taken over) | User arrays kept verbatim, re-including the corresponding directories of the real agentDir; the project-level portion is discovered natively by Pi | Pass-through |
 
-The `default` profile generates no filtering at all: settings are a verbatim copy of the user's global settings, re-including the real agentDir's `skills`/`extensions`/`prompts`/`themes` directories (because the discovery root has moved), do not set `defaultProjectTrust`, and behave identically to native Pi.
+A named profile controls skills and extensions independently. A declared field becomes a selection — an explicit empty array selects none — while an omitted field keeps Pi's native visibility and carries the user's own settings and package filters through unchanged. The ActivationPlan records that intent per kind as `resourceSelection`, and, when a RuntimeOverlay narrows an omitted kind, the concrete removed entries in `disabledSkills`/`disabledExtensions`. An overlay over an omitted kind adds only those concrete force-exclusions to the native base; it never turns the kind into a wildcard allowlist.
+
+A selection plan that omits `extensions` exposes the real extension directory through a conditional symlink at the managed instance path, created even when the target is absent; the directory is not added to the settings array, so Pi's basename patterns and marker-less glob filters keep their native meaning. The path is validated before any managed write: for a selection plan (omitted or declared), pre-existing non-symlink content at that path blocks activation with an actionable path-bearing error and is never deleted, adopted, or overwritten. The switch snapshot records the path's absence or raw link target, so a settings, link, or reload failure restores the prior representation before the rollback reload; the real directory is never part of rollback. A declared selection keeps the restrictive allowlist and has no generated link. Returning to the ordinary `default` profile removes only a mirror this session generated and retains its additive representation; foreign content is left untouched. The stale-instance sweep skips the link without traversing its target and keeps its warning-only treatment of real content inside an instance extension directory (ADR-0012).
+
+The `default` profile generates no filtering at all: settings are a verbatim copy of the user's global settings, re-including the real agentDir's `skills`/`extensions`/`prompts`/`themes` directories (because the discovery root has moved), do not set `defaultProjectTrust`, and behave identically to native Pi. A RuntimeOverlay on `default` resolves through the same per-kind control: both kinds are omitted, so an overlay narrows each from its native base.
 
 ## Modules and interfaces
 
@@ -51,9 +55,8 @@ The `default` profile generates no filtering at all: settings are a verbatim cop
 | --- | --- |
 | `bin/pi-profile.ts` | Entry point. Consumes the first positional argument (profile name) and the `--` that follows it; everything else becomes pi's argv verbatim |
 | `launcher/args.ts` | `parseLauncherArgs(argv)` → `{ profile, piArgs, trustOverride }`; `--approve`/`--no-approve` are rewritten into trust input |
-| `launcher/initial-profile.ts` | Positional argument or saved active profile → `InitialProfile`; unknown profiles fail here |
+| `launcher/initial-profile.ts` | Trust inputs and selected name → targeted catalog resolution and `InitialProfile`; normal default activation bypasses catalog access |
 | `launcher/discovery.ts` | `discoverLauncherResources()` → launcher-side read-only discovery result (skills, package roots) for the resolver |
-| `launcher/model-check.ts` | `checkDeclaredModel(agentDir, model)` → error message or undefined |
 | `launcher/spawn.ts` | Result of `generateRuntimeDir` + user arguments → spawn pi, write the `pid` liveness file, forward signals and exit code |
 | `launcher/runtime-cleanup.ts` | Sweeps stale instance directories by `pid` liveness at startup; routes unrecognized entries by content scan (adopt / delete / keep-with-warning) |
 
@@ -61,12 +64,12 @@ The `default` profile generates no filtering at all: settings are a verbatim cop
 
 | Module | Interface |
 | --- | --- |
-| `profile-catalog.ts` | Catalog read side: `ProfileCatalog` lists and parses winning definitions, producing `ResolvedProfile` (with `source: builtin \| global \| project`) |
+| `profile-catalog.ts` | `ProfileCatalog.load` indexes filenames and source metadata; asynchronous `resolve(name)` reads one winner; `list()` captures availability/errors/warnings per winning entry; `hasGlobal` and `diagnostics()` expose index metadata |
 | `project-trust.ts` | `resolveProjectTrust(input)` → boolean; mirrors Pi's decision order; decides whether pi-profile reads the project catalog, project state, and project MCP configuration (project-level resources themselves belong to Pi) |
 | `skill-registry.ts` | `discoverSkills(options)` → `SkillEntry[]`; read-only calls into Pi SDK discovery, never scans directories itself |
 | `extension-discovery.ts` | `discoverExtensions(options)` → `DiscoveredExtensions` (read-only, never executes extension code); `.select(refs)` resolves package names, aliases, loose-file stems, globs, and absolute paths |
-| `mcp-config.ts` | `discoverAdapterServerNames()` → server names configured in the adapter; `loadMergedMcpServers()` feeds instance `mcp.json` generation |
-| `profile-resolver.ts` | `resolveProfile(input)` → immutable `ActivationPlan` (skills, extensions, tools, MCP, model, instructions, `unmatched`, `filter`) |
+| `mcp-config.ts` | `loadMergedMcpServers()` returns the merged user-level `baseConfig`, effective server definitions (later source replaces same-named server in full), ownership (`serverOwners`), the `projectServers` set, and `diagnostics`. Activation, runtime preparation, and status use `invalidSource: "diagnose"`; strict mode remains an option for other callers. The [MCP reference contract](../../openspec/specs/resource-reference/spec.md#requirement-mcp-server-reference-resolution) owns source-content and transport outcomes. Status derives discovered names and user-disabled states from one trust-gated result and uses `projectServers` to keep trusted project-owned servers reported as enabled |
+| `profile-resolver.ts` | `resolveProfile(input)` → immutable `ActivationPlan` (skills, extensions, tools, MCP, model, instructions, `unmatched`, `diagnostics`, `filter`); diagnostic helpers share keyed merging and MCP snapshot inspection |
 
 ### Materialization and state
 
@@ -74,7 +77,7 @@ The `default` profile generates no filtering at all: settings are a verbatim cop
 | --- | --- |
 | `workspace.ts` | `~/.pi-profile-switch` workspace path (overridable via `PI_PROFILE_SWITCH_DIR`) |
 | `json-file.ts` | Shared JSON reading for file-backed stores |
-| `settings-generator.ts` | `generateRuntimeDir(plan, options)` (launcher, creates the directory) and `writeRuntimeFiles(runtimeDir, plan, options)` (in-session, rewrites in place) → generated files + platform mirror + `{ PI_CODING_AGENT_DIR }` |
+| `settings-generator.ts` | `generateRuntimeDir(plan, options)` (launcher, creates the directory) and `writeRuntimeFiles(runtimeDir, plan, options)` (in-session, rewrites in place) → generated files + platform mirror + `{ PI_CODING_AGENT_DIR }`. All content (settings, launch plan, MCP snapshot, diagnostics, gateway marker) is prepared in memory before any runtime file is written; `writeRuntimeFiles` returns `{ warnings }` and `generateRuntimeDir` carries them for the launcher's stderr. Declared subagent values are sparsely layered onto the native user settings before writes; see the [launcher contract](../../openspec/specs/launcher/spec.md) |
 | `runtime-mirror.ts` | Selects POSIX symbolic links or Windows junctions/hard links; validates the Windows ownership manifest and reconciles mutable files that were absent at launch |
 | `runtime-state-store.ts` | Reads and writes `pi-profile-state.json` (`activeProfile`, `overlay`) per source scope; the overlay holds up to four disabled-entry lists (skills, extensions, MCP servers, tools) |
 
@@ -82,20 +85,28 @@ The `default` profile generates no filtering at all: settings are a verbatim cop
 
 | Module | Interface |
 | --- | --- |
-| `extensions/pi-profile/index.ts` | Registers the `/profile` command family, the profile selector (degrading to the list without interactive UI), and the status view; loaded via `-e` |
-| `switching/switch-profile.ts` | `switchProfile(profile, deps, options)` → `SwitchResult`; orchestrates snapshot → rewrite → reload → rollback |
-| `switching/apply-plan.ts` | `readLaunchPlanFile(runtimeDir)` + `applyLaunchPlan(input)`; at `session_start` and after reload, applies the tools whitelist, persists runtime state, and emits the one-shot change summary |
+| `extensions/pi-profile/index.ts` | Registers the `/profile` command family, the profile selector (degrading to the list without interactive UI), and the status view; presents an activation failure through the current UI before the rollback reload and falls back to stderr when the UI is absent or the command context is already stale, so the cause survives the reload; loaded via `-e` |
+| `switching/switch-profile.ts` | `switchProfile(profile, deps, options)` → `SwitchResult`; orchestrates snapshot → rewrite → reload → rollback. The write-and-reload interval is one rollback boundary: any write-stage failure after the first managed file, or a reload failure, restores every managed file (and the extension-path representation) exactly and reloads again. Before that rollback reload the optional `SwitchDeps.reportFailure` callback delivers the actionable cause; a reporter failure never interrupts restoration or reload. Subagent settings and declarations use this same settings/plan snapshot boundary; see the [in-session contract](../../openspec/specs/in-session-switch/spec.md) |
+| `switching/apply-plan.ts` | `readLaunchPlanFile(runtimeDir)` + `applyLaunchPlan(input)`; at `session_start` and after reload, classifies the winning tool registrations by source path, applies only the non-MCP tools whitelist while retaining `builtin:mcp`-owned tools, re-applies overlays, persists runtime state, and emits the one-shot change summary |
 | `switching/overlay.ts` | `OVERLAY_USAGE` / `parseOverlayArgs` / `applyOverlayMutation` / `clearOverlay`; reads and writes the runtime overlay (one uniform `disable\|enable skill\|extension\|mcp\|tool <name-or-glob>` grammar) |
-| `switching/list-profiles.ts` | `listProfiles` / `formatProfileList`; profile entries for the selector and the degraded bare `/profile` list, with trust gating and the `shadowsGlobal` marker |
-| `switching/status.ts` | `buildStatusReport` / `formatStatusMarkdown`; resolved paths, overlay, MCP tri-state, conflicts |
-| `switching/tool-references.ts` | `expandToolReferences(refs, liveToolNames)`; expands tool references against Pi's live registry |
+| `switching/list-profiles.ts` | `listProfiles` / `formatProfileList`; winning entries for the selector and degraded list carry availability/errors/warnings and `shadowsGlobal`; optional `onDiagnostic` forwards filename diagnostics from the same loaded catalog |
+| `switching/status.ts` | `buildStatusReport` / `formatStatusMarkdown`; resolved paths, overlay, MCP server tri-state, declared per-server tool policy, and active-plan diagnostics. Retained policy entries carry state metadata instead of being presented as applied restrictions. When the plan carries a defined `mcps` selection, the optional `projectMcpServers` input (populated from `loadMergedMcpServers().projectServers`) keeps trusted project-owned, non-disabled servers in the enabled group and out of the disabled group. Subagent declaration status and registration observations follow the [in-session contract](../../openspec/specs/in-session-switch/spec.md) |
+| `switching/tool-references.ts` | `expandToolReferences(refs, nonMcpToolNames, mcpToolNames)`; expands non-MCP tool references against Pi's live registry and identifies legacy MCP references |
 | `startup-notifier.ts` | `runStartupNotifications(options)`; loads notification caches, checks remote sources, and presents notices through the extension's display surface |
+
+### Activation diagnostics
+
+`ResolutionDiagnostic` is defined in `src/profile-resolver.ts`. `mergeResolutionDiagnostics` keys issues by kind, reference, source path, and code. Initial resolution normalizes catalog and extension-discovery warnings alongside reference results; runtime preparation merges its own MCP snapshot diagnostics before serialization.
+
+`LaunchPlanFile.diagnostics` stores the additive array in `pi-profile.json`; older plans omit it. The launcher combines resolution and materialization output on stderr. The reloaded extension delivers persisted diagnostics through its fresh context, while command feedback retains other warnings without replaying those already delivered. Status reads the active plan and fresh trust-gated MCP discovery without parsing catalog definitions. Listing uses one catalog index, with filename diagnostics separate from profile entries.
+
+The [observability contract](../../openspec/specs/in-session-switch/spec.md#requirement-observability-surface) owns display and structured-message behavior; the [partial-materialization contract](../../openspec/specs/launcher/spec.md#requirement-restrictive-partial-materialization) owns restrictive intent. The decision is ADR-0018 ([record](../adr/0018-tolerant-activation-with-restrictive-partial-resolution.md)).
 
 ### Startup notifications (inside the pi process)
 
-The pi-profile extension owns startup presentation. After applying the initial launch plan, it reads the running package version from its installed `package.json`, creates a notice surface using `ctx.ui.notify` or stderr, and starts `runStartupNotifications` without awaiting it. The notifier evaluates cached responses before refreshing remote sources; requests have time limits and cancellation. For when notices run, where they appear, and how offline launches behave, see the [launcher notification requirements](../../openspec/specs/launcher/spec.md#requirement-startup-only-mode-safe-delivery).
+The pi-profile extension owns startup presentation. After applying the initial launch plan, it reads the running package version from its installed `package.json`, creates a notice surface using `ctx.ui.notify` or stderr, and starts `runStartupNotifications` without awaiting it. The notifier evaluates cached responses before refreshing remote sources; requests have time limits and cancellation. Its npm lookup uses the compact dist-tags response ([source-selection design](../../openspec/changes/archive/2026-10-01-fix-startup-upgrade-reminder/design.md)). For when notices run, where they appear, and how offline launches behave, see the [launcher notification requirements](../../openspec/specs/launcher/spec.md#requirement-startup-only-mode-safe-delivery).
 
-Notification state is stored under `<PI_PROFILE_SWITCH_DIR>/notifications/`, apart from the instance and profile runtime state. Per-source validated responses (`npm-latest.json`, `announcements-feed.json`), the displayed-history record (`displayed.json`), and transient display claims (`claims/`) are versioned private formats, replaced wholesale when corrupt. For cache and history behavior, see the [launcher remote-check requirements](../../openspec/specs/launcher/spec.md#requirement-best-effort-remote-checks-and-global-history). The announcement feed address and format are a long-lived external commitment: see ADR-0014.
+Notification state is stored under `<PI_PROFILE_SWITCH_DIR>/notifications/`, apart from the instance and profile runtime state. Per-source validated responses (`npm-latest.json`, `announcements-feed.json`) and the displayed-history record (`displayed.json`) are versioned private formats, replaced wholesale when corrupt. For cache and history behavior, see the [launcher remote-check requirements](../../openspec/specs/launcher/spec.md#requirement-best-effort-remote-checks-and-global-history). The announcement feed address and format are a long-lived external commitment: see ADR-0014.
 
 ## Activation flow
 
@@ -105,14 +116,15 @@ Notification state is stored under `<PI_PROFILE_SWITCH_DIR>/notifications/`, apa
 pi-profile review -- --mode rpc
   │
   ├─ parseLauncherArgs: take review, intercept --approve, pass the rest through
-  ├─ ProfileCatalog resolves the winning source of review
-  ├─ project-trust reads the real trust.json → projectTrusted
+  ├─ readTrustInputs: resolve project trust before project-scoped reads
+  ├─ Choose positional or saved name; normal default bypasses the catalog
+  ├─ Named selection: ProfileCatalog.load indexes → resolve(name) reads the winner
   ├─ skill-registry + extension-discovery + mcp-config read-only discovery
-  ├─ resolveProfile → ActivationPlan (glob expansion, overlay application, unmatched collection)
-  ├─ Validation: declared model authenticated, extension entries exist, MCP adapter and servers exist
+  ├─ resolveProfile → ActivationPlan (resource expansion, overlays, diagnostics, native declarations)
   ├─ generateRuntimeDir → this run's instance directory (generated files + seed + platform mirror + env)
   └─ spawnPi: -e <extension> [trust flag] <user args verbatim>
-       └─ the extension reads pi-profile.json at session_start, expands tools and setActiveTools
+       ├─ Pi loads extensions before native startup model selection
+       └─ the extension reads pi-profile.json at session_start, classifies winning registrations, expands non-MCP tools, retains `builtin:mcp`-owned tools, and applies overlays
 ```
 
 ### In-session switching
@@ -120,9 +132,9 @@ pi-profile review -- --mode rpc
 ```text
 /profile use implement
   │
-  ├─ Validate and resolve (same path as launch)
   ├─ ctx.waitForIdle()
   ├─ Snapshot managed runtime files (settings / plan / mcp / appendSystem / trust)
+  ├─ Re-resolve through the shared launch path
   ├─ Rewrite settings.json, pi-profile.json, mcp.json, APPEND_SYSTEM.md in place; trust.json link unchanged
   ├─ ctx.reload(): Pi re-reads disk, rebuilds resources, re-executes the extension
   │    ├─ the extension re-applies the tools whitelist
@@ -131,26 +143,26 @@ pi-profile review -- --mode rpc
   └─ Failure → write back the snapshot and reload again; the runtime never shows a half-switched state
 ```
 
-The sessionId and message history are identical before and after reload (verified in ADR-0005).
+Native reload refreshes resources and settings without repeating initial model selection. For precedence and lifecycle guarantees, see [native model handoff](../../openspec/specs/launcher/spec.md#requirement-native-model-declaration-handoff) and [in-session switching](../../openspec/specs/in-session-switch/spec.md#requirement-in-session-switching).
 
 ## Runtime directory
 
 Each launch generates one instance directory at `<PI_PROFILE_SWITCH_DIR>/instances/launch-<random id>` (the workspace root defaults to `~/.pi-profile-switch`, overridable via `PI_PROFILE_SWITCH_DIR`), handed to pi via `PI_CODING_AGENT_DIR`. The path is bound to one launch and never reused: `PI_CODING_AGENT_DIR` cannot change inside the child process, so a fixed path could neither follow in-session switching nor survive concurrent launches rewriting each other's files (ADR-0010).
 
-Managed files, mirroring, and sweep rules are contractual — see "Instance directory contract", "Stale instance sweep", and "Instance runtime-state seed" in `openspec/specs/launcher/spec.md`. What each managed file is for:
+Managed files, mirroring, and sweep rules are contractual — see "Instance directory layout", "Stale instance sweep", and "Instance runtime-state seed" in `openspec/specs/launcher/spec.md`. What each managed file is for:
 
 | File | Contents |
 | --- | --- |
 | `settings.json` | User global settings + arrays rewritten per the filtering model (user-level resources only; project settings are not merged) |
 | `pi-profile.json` | This run's ActivationPlan, read by the in-pi extension at `session_start` |
-| `mcp.json` | The filtered MCP server set |
+| `mcp.json` | The generated MCP configuration snapshot — see "Instance MCP configuration snapshot" in `openspec/specs/launcher/spec.md` |
 | `APPEND_SYSTEM.md` | The profile's `instructions`, natively appended by Pi to the system prompt |
-| `trust.json` | Shared with the real trust store through the platform mirror; on Windows, a missing first-write is deferred and reconciled. Pi's project-level discovery follows it, and in-session switching never replaces a shared entry. Form and creation conditions in `openspec/specs/launcher/spec.md`, "Instance directory contract" |
+| `trust.json` | Shared with the real trust store through the platform mirror; on Windows, a missing first-write is deferred and reconciled. Pi's project-level discovery follows it, and in-session switching never replaces a shared entry. Form and creation conditions in `openspec/specs/launcher/spec.md`, "Instance directory layout" |
 | `pid` | Child-process liveness marker; the next launch's sweep uses it to decide reclamation |
-| `extensions` | Managed directory so that agentDir-level extensions enter only through the whitelist |
+| `extensions` | Managed path: a conditional directory link (junction on Windows) to the real extensions directory when the profile omits extensions, otherwise absent so extension entries enter only through the declared whitelist |
 | `pi-profile-mirror.json` | Windows-only private ownership manifest for junctions, hard links, and deferred mutable files |
 
-All other entries under the real agentDir stay in place and enter the instance through the platform mirror: symbolic links on non-Windows systems, directory junctions and same-volume file hard links on Windows (ADR-0015). Entries that do not exist at generation time but are created at runtime are handled by the seed described below. This state is therefore never copied: `npm/`, `git/`, `bin/` are package install roots; `sessions/` keeps Pi's native per-directory structure and session files are always written in the real agentDir. User configuration files are never modified.
+All other entries under the real agentDir stay in place and enter the instance through the platform mirror: symbolic links on non-Windows systems, directory junctions and same-volume file hard links on Windows (ADR-0019). Entries that do not exist at generation time but are created at runtime are handled by the seed described below. This state is therefore never copied: `npm/`, `git/`, `bin/` are package install roots; `sessions/` keeps Pi's native per-directory structure and session files are always written in the real agentDir. User configuration files are never modified.
 
 ### Runtime-state seed
 
@@ -159,7 +171,7 @@ The mirror is a snapshot taken at generation time: only entries that already exi
 Which paths are seeded, and in what form, is a behavior contract — see "Instance runtime-state seed" in `openspec/specs/launcher/spec.md`. Only two maintenance rules live here:
 
 - The list only admits entries with **observed evidence** (a real run actually created the entry under agentDir); inference is not enough. Unlisted entries are routed by the sweep's content scan (see "Instance sweep"), never silently destroyed.
-- Directories can be created directly (an empty directory's semantics are unambiguous); files must not be pre-created because their content belongs to Pi. On non-Windows systems files use **dangling-tolerant** symbolic links: Pi sees them as absent and writes through to the real agentDir. Windows records a missing file as deferred, then reconciles a Pi-created instance file after child exit or during the next startup sweep. Identical concurrent copies collapse; divergent copies are both kept and reported. See ADR-0015.
+- Directories can be created directly (an empty directory's semantics are unambiguous); files must not be pre-created because their content belongs to Pi. On non-Windows systems files use **dangling-tolerant** symbolic links: Pi sees them as absent and writes through to the real agentDir. Windows records a missing file as deferred, then reconciles a Pi-created instance file after child exit or during the next startup sweep. Identical concurrent copies collapse; divergent copies are both kept and reported. See ADR-0019.
 
 ### Instance sweep
 
@@ -189,7 +201,7 @@ For reading convenience, not a stable surface: this format evolves with Pi versi
 
 ### User configuration contract
 
-The authoritative schema for profile definition files (global `~/.pi-profile-switch/profiles/<name>.json`, project `.pi/profiles/<name>.json`) is `schemas/profiles.schema.json`. Core fields: a profile's `skills`/`extensions`/`mcps`/`tools` (names or globs), optional `defaultProvider`/`defaultModel`/`defaultThinkingLevel` and `instructions`; state's `activeProfile` and `overlay`.
+The authoritative schema for profile definition files (global `~/.pi-profile-switch/profiles/<name>.json`, project `.pi/profiles/<name>.json`) is `schemas/profiles.schema.json`. Core fields: a profile's `skills`/`extensions`/`mcps`/`tools` (names or globs), optional `defaultProvider`/`defaultModel`/`defaultThinkingLevel`, `instructions`, and native subagent declarations; state's `activeProfile` and `overlay`. The native-shaped profile boundary and rejected alternatives are recorded in [ADR-0017](../adr/0017-native-subagent-settings-overrides.md).
 
 ## Known limitations
 
@@ -200,7 +212,7 @@ The authoritative schema for profile definition files (global `~/.pi-profile-swi
 | The extension `project_trust` event is not consulted | Consulting it would require executing extension code inside the launcher; third-party extensions depending on that event cannot influence the trust determination |
 | `pi install` and `pi config` write into the generated settings mid-session | Lost on exit; persistent changes go through direct catalog file editing or native `pi` |
 | Legacy 0.4.x `instances/<profile>/agent` directories are untouched by the new sweep | Neither cleaned nor migrated; users dispose of them manually. The pi-subagents mission records inside carry absolute paths pointing at old instance paths and cannot be repaired (see ADR-0010) |
-| Concurrent instances do not serialize writes to credential files | Existing files are shared through the platform mirror, but Pi's lock lands beside the instance path, so concurrent replacement-style refreshes may still race. On Windows, divergent first writes to deferred files are retained and reported rather than merged (see ADR-0015) |
+| Concurrent instances do not serialize writes to credential files | Existing files are shared through the platform mirror, but Pi's lock lands beside the instance path, so concurrent replacement-style refreshes may still race. On Windows, divergent first writes to deferred files are retained and reported rather than merged (see ADR-0019) |
 | Windows file mirrors require compatible storage | Hard links cannot cross volumes; a Windows launch fails clearly instead of copying an existing real-agentDir file. Keep `PI_PROFILE_SWITCH_DIR` on the same local volume as the real agentDir |
 | Skills provided by project packages are not referenceable | They are visible through Pi's native loading but do not appear in a profile's reference vocabulary; project `.pi/skills` and ancestor `.agents/skills` are referenceable |
 
@@ -211,7 +223,7 @@ The authoritative schema for profile definition files (global `~/.pi-profile-swi
 | `bin/` | CLI entry and postinstall. The published `pi-profile.js` is a jiti wrapper — Node refuses type-stripping for `.ts` under `node_modules`, while the launcher needs to load the shared TS graph; in development, `pi-profile.ts` runs directly. `postinstall.js` remains as a best-effort early optimization: it distributes the starter `ask` profile and the profile-config skill at install time, while runtime distribution is guaranteed by the launcher's ensure step (see `src/starter-assets.ts`); the authoritative behavior contract is [openspec/specs/profile-catalog/spec.md](../../openspec/specs/profile-catalog/spec.md) |
 | `extensions/pi-profile/` | The extension inside the pi process: `/profile` command family, switch orchestration, status views |
 | `src/starter-assets.ts` | Starter-asset ensure at launcher startup: a single TS implementation exporting `ensureStarterAssets()` (returns `path`/`written` per asset; IO failures degrade to `warnings`, never throw — design in [design.md D1/D5](../../openspec/changes/archive/2026-09-24-runtime-ensure-starter-assets/design.md)); the behavior contract is not restated here — see [openspec/specs/profile-catalog/spec.md](../../openspec/specs/profile-catalog/spec.md) |
-| `src/launcher/` | Everything before spawn: argument parsing, initial-profile resolution, read-only discovery, model check, spawn, stale-directory sweep |
+| `src/launcher/` | Everything before spawn: argument parsing, initial-profile resolution, read-only discovery, native settings handoff, spawn, stale-directory sweep |
 | `src/switching/` | In-session switching, overlay, observability surface |
 | `src/*.ts` | Modules shared by both sides: catalog, trust, discovery, resolver, settings generation, state stores |
 | `schemas/` | `profiles.schema.json`, the authoritative definition of user configuration |
